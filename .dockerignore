@@ -1,0 +1,9 @@
+**
+!go.mod
+!openfir.go
+!openfir_test.go
+!internal/
+!internal/**
+!LICENSE
+!docker/
+!docker/LICENSE-hysteria

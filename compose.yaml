@@ -1,0 +1,38 @@
+x-proxy: &proxy
+  image: ${OPENFIR_IMAGE:-openfir-proxy:test}
+  user: "${OPENFIR_UID:-1000}:${OPENFIR_GID:-1000}"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+
+services:
+  server:
+    <<: *proxy
+    profiles: [server]
+    command: ["-mode", "proxy-server", "-proxy-config", "/config/config.json"]
+    volumes:
+      - type: bind
+        source: ${OPENFIR_PROFILE_DIR:-./profiles}/server
+        target: /config
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "${OPENFIR_UDP_PORT:-443}:${OPENFIR_UDP_PORT:-443}/udp"
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+
+  client:
+    <<: *proxy
+    profiles: [client]
+    command: ["-mode", "proxy-client", "-proxy-config", "/config/config.json"]
+    # SOCKS5 UDP ASSOCIATE advertises a dynamically allocated local relay port.
+    network_mode: host
+    volumes:
+      - type: bind
+        source: ${OPENFIR_PROFILE_DIR:-./profiles}/client
+        target: /config
+        read_only: true
+        bind:
+          create_host_path: false

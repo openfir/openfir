@@ -115,6 +115,10 @@ Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame 
 
 ---
 
+## Encrypted UDP proxy
+
+OpenFIR also supports SOCKS5 TCP and UDP relay and fixed port forwarding through a Hysteria 2 QUIC tunnel. The Docker image includes OpenFIR and Hysteria 2 for both server and client. Native deployments require the Hysteria 2 executable on both endpoints. Run `openfir -mode proxy-init -server HOST:PORT` to generate paired profiles. [代理配置、启动与验证（中文）](docs/proxy.zh.md)
+
 ## Quick Start
 
 ### Prerequisites

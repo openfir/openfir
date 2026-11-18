@@ -27,6 +27,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/openfir/openfir/internal/proxy"
 )
 
 // ============================================================================
@@ -3040,10 +3042,10 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 // ============================================================================
 
 func main() {
-	mode := flag.String("mode", "", "Execution mode: server | client | selftest")
+	mode := flag.String("mode", "", "Execution mode: server | client | selftest | proxy-init | proxy-server | proxy-client")
 	listen := flag.String("listen", "0.0.0.0:9900", "Server UDP listen address")
 	outDir := flag.String("out", "./openfir_downloads", "Server output directory for received files/directories")
-	serverAddr := flag.String("server", "127.0.0.1:9900", "Target server UDP address for client mode")
+	serverAddr := flag.String("server", "127.0.0.1:9900", "Server UDP endpoint for client and proxy-init modes")
 	filePath := flag.String("file", "", "Path to input file OR directory for client mode")
 	numSockets := flag.Int("sockets", 8, "Number of concurrent local UDP sockets for multi-path striping")
 	initRate := flag.Float64("init-mbps", 50.0, "Initial client pacing rate in MB/s")
@@ -3055,11 +3057,17 @@ func main() {
 	timeoutSec := flag.Int("timeout", 25, "Session idle/stall timeout in seconds")
 	simLoss := flag.Float64("sim-loss", 0.0, "Simulated packet loss ratio (0.0 disables simulation in production)")
 	simBurst := flag.Int("sim-burst", 4, "Simulated contiguous burst drop length")
+	proxyDir := flag.String("proxy-dir", "openfir-proxy", "New directory for paired proxy profiles (proxy-init)")
+	proxyConfig := flag.String("proxy-config", "config.json", "Hysteria 2 configuration file (proxy-client or proxy-server)")
+	socksAddr := flag.String("socks", "127.0.0.1:1080", "Local SOCKS5 TCP and UDP relay address (proxy-init)")
 	flag.Parse()
 
 	if *mode == "" {
 		fmt.Fprintf(os.Stderr, "OpenFIR v0.2.2 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintln(os.Stderr, "  Proxy profiles : openfir -mode proxy-init -server <public-host:port>")
+		fmt.Fprintln(os.Stderr, "  Proxy server  : openfir -mode proxy-server -proxy-config openfir-proxy/server/config.json")
+		fmt.Fprintln(os.Stderr, "  Proxy client  : openfir -mode proxy-client -proxy-config openfir-proxy/client/config.json")
 		fmt.Fprintf(os.Stderr, "  Run self-test : openfir -mode selftest\n")
 		fmt.Fprintf(os.Stderr, "  Start server  : openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret <64-hex-chars>\n")
 		fmt.Fprintf(os.Stderr, "  Send file/dir : openfir -mode client -server <ip>:9900 -file ./path -secret <64-hex-chars>\n\n")
@@ -3068,6 +3076,17 @@ func main() {
 	}
 
 	switch *mode {
+	case "proxy-init":
+		if err := proxy.Init(*proxyDir, *serverAddr, *socksAddr); err != nil {
+			fmt.Fprintln(os.Stderr, "[Proxy]", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Created %s/server and %s/client. Install each profile on its corresponding host.\n", *proxyDir, *proxyDir)
+	case "proxy-client", "proxy-server":
+		if err := proxy.Run(strings.TrimPrefix(*mode, "proxy-"), *proxyConfig); err != nil {
+			fmt.Fprintln(os.Stderr, "[Proxy]", err)
+			os.Exit(1)
+		}
 	case "selftest":
 		loss := *simLoss
 		if loss <= 0 {
@@ -3146,7 +3165,7 @@ func main() {
 		}
 
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown mode: %s (expected: selftest | server | client)\n", *mode)
+		fmt.Fprintf(os.Stderr, "Unknown mode: %s (see -help for modes)\n", *mode)
 		os.Exit(1)
 	}
 }

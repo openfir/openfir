@@ -1,0 +1,4 @@
+# Local proxy profiles contain authentication credentials and private keys.
+/profiles/
+/openfir-proxy/
+/.env
