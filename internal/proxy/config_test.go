@@ -15,10 +15,10 @@ func TestPairedProfiles(t *testing.T) {
 		t.Run(endpoint, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "profiles")
 			const socks = "127.0.0.1:1081"
-			if err := Init(dir, endpoint, socks); err != nil {
+			if err := Init(dir, endpoint, socks, 4); err != nil {
 				t.Fatal(err)
 			}
-			if err := Init(dir, endpoint, socks); err == nil {
+			if err := Init(dir, endpoint, socks, 4); err == nil {
 				t.Fatal("second initialization replaced existing profiles")
 			}
 			read := func(name string) []byte {
@@ -30,17 +30,17 @@ func TestPairedProfiles(t *testing.T) {
 				return data
 			}
 			var client struct {
-				Server string
-				Auth   string
-				Obfs   json.RawMessage
-				TLS    struct{ CA string }
-				Socks5 struct{ Listen string }
+				Server  string
+				Auth    string
+				OpenFIR json.RawMessage
+				TLS     struct{ CA string }
+				Socks5  struct{ Listen string }
 			}
 			var server struct {
-				Listen string
-				Auth   struct{ Type, Password string }
-				Obfs   json.RawMessage
-				TLS    struct{ Cert, Key string }
+				Listen  string
+				Auth    struct{ Type, Password string }
+				OpenFIR json.RawMessage
+				TLS     struct{ Cert, Key string }
 			}
 			if err := json.Unmarshal(read("client/config.json"), &client); err != nil {
 				t.Fatal(err)
@@ -50,7 +50,7 @@ func TestPairedProfiles(t *testing.T) {
 			}
 			if client.Server != endpoint || client.Socks5.Listen != socks || server.Listen != ":443" ||
 				len(client.Auth) < 32 || server.Auth.Type != "password" || server.Auth.Password != client.Auth ||
-				len(client.Obfs) == 0 || string(client.Obfs) != string(server.Obfs) {
+				len(client.OpenFIR) == 0 || string(client.OpenFIR) != string(server.OpenFIR) {
 				t.Fatal("profiles disagree on relay settings or credentials")
 			}
 			pair, err := tls.X509KeyPair(read("server/"+server.TLS.Cert), read("server/"+server.TLS.Key))

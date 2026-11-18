@@ -5,5 +5,3 @@
 !internal/
 !internal/**
 !LICENSE
-!docker/
-!docker/LICENSE-hysteria

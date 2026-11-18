@@ -1,4 +1,4 @@
-// Package proxy prepares paired Hysteria 2 configurations for OpenFIR proxy modes.
+// Package proxy prepares paired native UDP proxy configurations for OpenFIR proxy modes.
 package proxy
 
 import (
@@ -61,7 +61,10 @@ func certificate(host string) (cert, key []byte, err error) {
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER}), nil
 }
 
-func Init(dir, endpoint, socks string) error {
+func Init(dir, endpoint, socks string, paths int) error {
+	if paths < 1 || paths > 16 {
+		return errors.New("-sockets must be in [1,16]")
+	}
 	host, port, err := net.SplitHostPort(endpoint)
 	portNum, portErr := strconv.Atoi(port)
 	if err != nil || host == "" || portErr != nil || portNum < 1 || portNum > 65535 {
@@ -78,7 +81,7 @@ func Init(dir, endpoint, socks string) error {
 	if err != nil {
 		return err
 	}
-	obfsPassword, err := password()
+	transportKey, err := password()
 	if err != nil {
 		return err
 	}
@@ -86,19 +89,19 @@ func Init(dir, endpoint, socks string) error {
 	if err != nil {
 		return err
 	}
-	obfs := map[string]any{"type": "salamander", "salamander": map[string]string{"password": obfsPassword}}
+	wire := map[string]any{"key": transportKey, "sockets": paths}
 	serverConfig := map[string]any{
-		"listen": net.JoinHostPort("", port),
-		"auth":   map[string]string{"type": "password", "password": auth},
-		"obfs":   obfs,
-		"tls":    map[string]string{"cert": "server.crt", "key": "server.key"},
+		"listen":  net.JoinHostPort("", port),
+		"auth":    map[string]string{"type": "password", "password": auth},
+		"openfir": wire,
+		"tls":     map[string]string{"cert": "server.crt", "key": "server.key"},
 	}
 	clientConfig := map[string]any{
-		"server": endpoint,
-		"auth":   auth,
-		"obfs":   obfs,
-		"tls":    map[string]string{"ca": "server.crt"},
-		"socks5": map[string]string{"listen": addr.String()},
+		"server":  endpoint,
+		"auth":    auth,
+		"openfir": wire,
+		"tls":     map[string]string{"ca": "server.crt"},
+		"socks5":  map[string]string{"listen": addr.String()},
 	}
 	// Reserve a fresh directory so a second invocation cannot replace credentials.
 	if err := os.Mkdir(dir, 0700); err != nil {

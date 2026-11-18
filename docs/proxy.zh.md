@@ -1,10 +1,18 @@
 # OpenFIR 加密 UDP 代理
 
-应用连接本机 SOCKS5 端口，OpenFIR 的代理模式启动 Hysteria 2，通过 QUIC/UDP 连接远端服务器。远端再用目标应用需要的 TCP 或 UDP 协议连接目标。支持 SOCKS5 CONNECT、UDP ASSOCIATE 和固定端口转发。
+应用连接本机 SOCKS5 端口，OpenFIR 客户端通过原生加密 UDP 协议连接远端 OpenFIR 服务端。远端再用目标应用需要的 TCP 或 UDP 协议连接目标。支持 SOCKS5 CONNECT、UDP ASSOCIATE 和固定端口转发。
+
+## 传输方式
+
+客户端将数据轮流发到多个 UDP socket，服务端按会话识别这些地址，并轮流向已经确认的地址回包。`proxy-init -sockets 4` 可指定路径数（1 到 16）。每 20 个数据包按步长 5 编成 5 个 XOR 校验组，每组有一个校验包；组内只缺一包时可在本地恢复。收发两端使用 OpenFIR 文件传输代码共用的 Kalman 时延估计和令牌桶调速器。多个 socket 能否走不同物理链路取决于网络路由。
+
+TCP 会话有独立的排序、接收窗口、选择性确认和超时重传，支持双向半关闭。UDP 会话直接发送带边界的数据报，可分片和重组；校验仍无法恢复丢失分片时，丢弃对应的数据报，后续消息可继续到达。文件模式的暂存、全文件哈希和重复分块索引只用于文件传输。
+
+公网数据包采用方向分离的 AES-GCM 密钥。客户端在可靠通道上通过 TLS 1.3 验证服务端证书，再提交代理密码。每个 UDP 关联使用从该 TLS 会话派生的独立报文密钥。此协议没有做过独立安全审计，当前验证范围为本地网络和可控丢包，跨境可达性需要实测。
 
 ## 用 Docker 部署两端（Linux）
 
-服务端和客户端使用同一份镜像 `openfir-proxy:test`，里面包含 OpenFIR 和 Hysteria 2。两台机器都需要 Docker。下面的 Compose 命令在 `compose.yaml` 所在目录执行。
+服务端和客户端使用同一份镜像 `openfir-proxy:test`，镜像只包含 OpenFIR 可执行文件和许可证。两台机器都需要 Docker。下面的 Compose 命令在 `compose.yaml` 所在目录执行。
 
 **准备镜像。** 在仓库根目录运行 `docker build -t openfir-proxy:test .`。也可以在与目标机架构相同的机器构建一次，用 `docker save openfir-proxy:test | gzip > openfir-proxy.tar.gz` 导出，将压缩包复制到另一台机器，再运行 `docker load -i openfir-proxy.tar.gz`。通过归档部署时，同时复制仓库里的 `compose.yaml`。Dockerfile 支持 Linux amd64 和 arm64，单架构归档应与目标机器匹配。
 
@@ -39,7 +47,7 @@ curl --noproxy '' --proxy socks5h://127.0.0.1:1080 https://example.org/
 
 ## 直接运行可执行文件
 
-1. 两端各准备一份 OpenFIR 和 Hysteria 2。OpenFIR 可在仓库根目录用 `go build -o openfir .` 编译。下载对应平台的 Hysteria 2，将可执行文件命名为 `hysteria`（Windows 用 `hysteria.exe`），放到 PATH 中。本仓库用 Hysteria 2.14.0 做了本地互通测试。[Hysteria 2 官方安装说明](https://v2.hysteria.network/zh/docs/getting-started/Installation/)
+1. 两端各准备一份 OpenFIR。在仓库根目录运行 `go build -o openfir .` 即可编译，只依赖 Go 标准库。
 2. 在一台可信设备上运行下面的命令一次。将 `relay.example.org` 换成客户端实际访问的服务器域名或 IP，将 `443` 换成服务器能监听且网络允许入站的 **UDP** 端口。IPv6 地址用方括号包围。使用 443 等低端口时，服务端进程需要对应的绑定权限。
 
    ```sh
@@ -60,7 +68,7 @@ curl --noproxy '' --proxy socks5h://127.0.0.1:1080 https://example.org/
    ./openfir -mode proxy-client -proxy-config profiles/client/config.json
    ```
 
-生成的客户端配置使用配对的证书校验服务端身份，证书有效期为两年。更换主机名、凭据或到期证书时，可在新目录生成并部署一对新配置。配置默认启用 Salamander 混淆。实际连通性取决于客户端到服务器的 UDP 路径、端口和网络策略，需在实际使用的网络验证。
+生成的客户端配置使用配对的证书校验服务端身份，证书有效期为两年。更换主机名、凭据或到期证书时，可在新目录生成并部署一对新配置。两端需要同时升级到原生代理版本。之前使用本仓库 `proxy-init` 生成的配对配置仍可读取，原生协议与 Hysteria 2 的网络协议不互通。实际连通性取决于客户端到服务器的 UDP 路径、端口和网络策略，需在实际使用的网络验证。
 
 ## 使用和验证
 
@@ -70,7 +78,7 @@ curl --noproxy '' --proxy socks5h://127.0.0.1:1080 https://example.org/
 curl --proxy socks5h://127.0.0.1:1080 https://example.org/
 ```
 
-支持 SOCKS5 UDP ASSOCIATE 的应用可通过同一入口转发 UDP。需要固定端口转发时，在客户端已有的 `config.json` 顶层加入需要的字段，然后重启代理客户端。例如，下面两个字段分别将本地 TCP 端口 8080 转到服务端视角下的 `127.0.0.1:8000`，将本地 UDP 端口 5353 转到指定的 DNS 服务器。保留已生成的 server、tls、auth、obfs 和 socks5 字段。
+支持 SOCKS5 UDP ASSOCIATE 的应用可通过同一入口转发 UDP。需要固定端口转发时，在客户端已有的 `config.json` 顶层加入需要的字段，然后重启代理客户端。例如，下面两个字段分别将本地 TCP 端口 8080 转到服务端视角下的 `127.0.0.1:8000`，将本地 UDP 端口 5353 转到指定的 DNS 服务器。保留已生成的 server、tls、auth、openfir 和 socks5 字段。
 
 ```json
 {
@@ -79,6 +87,4 @@ curl --proxy socks5h://127.0.0.1:1080 https://example.org/
 }
 ```
 
-启用上述 UDP 转发后，可以用 `dig @127.0.0.1 -p 5353 example.org A` 验证 DNS 请求和响应。UDP 入口也适合无法配置 SOCKS5 的应用。[Hysteria 2 客户端配置](https://v2.hysteria.network/zh/docs/advanced/Full-Client-Config/)
-
-**已测边界。** 在 Hysteria 2.14.0 的本地回环测试中，SOCKS5 UDP 有效负载为 32、1500 和 3000 字节时往返成功，空载荷和 4096 字节载荷未收到回包。SOCKS5 TCP 正常双向读写通过，客户端发送后立即半关闭写端的测试未能读完整响应。依赖这些行为的应用需要单独验证。
+启用上述 UDP 转发后，可以用 `dig @127.0.0.1 -p 5353 example.org A` 验证 DNS 请求和响应。UDP 入口也适合无法配置 SOCKS5 的应用。

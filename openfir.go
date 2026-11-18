@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/openfir/openfir/internal/proxy"
+	"github.com/openfir/openfir/internal/transport"
 )
 
 // ============================================================================
@@ -64,9 +65,9 @@ const (
 	MaxUDPPacketSize        = 1500             // Maximum valid OpenFIR protocol frame size
 	MaxUDPDatagramSize      = 65536            // Full 64 KB buffer to prevent Windows WSAEMSGSIZE
 	SocketBufferBytes       = 16 * 1024 * 1024 // 16 MB kernel socket buffer target
-	PhiWindowSize           = 20               // Sliding window size for coprime interleaving
-	PhiStride               = 5                // Coprime stride (5 * 4 = 20); absorbs 5-packet burst losses
-	PhiGroupMembers         = 4                // Data chunks per algebraic parity equation
+	PhiWindowSize           = transport.Window
+	PhiStride               = transport.Stride
+	PhiGroupMembers         = transport.Members
 	MaxPendingParity        = 512              // Maximum active equations in peeling decoder graph
 	MaxNackPerPacket        = 160              // Maximum NACK chunk IDs per feedback frame
 	FeedbackScanWindow      = 32768            // Receiver NACK/SACK scan horizon per feedback frame
@@ -75,8 +76,6 @@ const (
 	MaxTeleportIndexEntries = 500000           // Cap sender deduplication map to bound memory usage
 	CookieSize              = 16               // 128-bit stateless handshake cookie size
 	OuterHeaderSize         = 19               // [6B "OFIRv1"][1B Dir][8B Seq][4B RandSalt]
-	ReplayWindowWords       = 128              // 128 * 64 = 8192-packet sliding anti-replay window
-	ReplayWindowBits        = ReplayWindowWords * 64
 )
 
 var (
@@ -119,25 +118,6 @@ func cryptoRandUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
-// hkdfSHA256 implements RFC 5869 Extract-and-Expand for 32-byte key derivation.
-func hkdfSHA256(ikm, salt, info []byte) [32]byte {
-	if len(salt) == 0 {
-		salt = make([]byte, sha256.Size)
-	}
-	extractor := hmac.New(sha256.New, salt)
-	extractor.Write(ikm)
-	prk := extractor.Sum(nil)
-
-	expander := hmac.New(sha256.New, prk)
-	expander.Write(info)
-	expander.Write([]byte{0x01})
-	okm := expander.Sum(nil)
-
-	var out [32]byte
-	copy(out[:], okm[:32])
-	return out
-}
-
 // parseSecretMaterial validates and derives a 256-bit master key from user input.
 // Fails closed on malformed input rather than silently falling back.
 func parseSecretMaterial(raw string) ([32]byte, bool, error) {
@@ -174,7 +154,7 @@ func parseSecretMaterial(raw string) ([32]byte, bool, error) {
 		}
 	}
 
-	masterKey := hkdfSHA256(ikm, []byte("OpenFIR-v2-Master-Salt"), []byte("OpenFIR-v2-Master-Key"))
+	masterKey := transport.HKDF(ikm, []byte("OpenFIR-v2-Master-Salt"), []byte("OpenFIR-v2-Master-Key"))
 	return masterKey, isDemo, nil
 }
 
@@ -185,8 +165,8 @@ type WireCryptoEngine struct {
 }
 
 func NewWireCryptoEngine(masterKey [32]byte) (*WireCryptoEngine, error) {
-	c2sKey := hkdfSHA256(masterKey[:], []byte("OpenFIR-v2-Dir-Salt"), []byte("OpenFIR-v2-C2S-AEAD"))
-	s2cKey := hkdfSHA256(masterKey[:], []byte("OpenFIR-v2-Dir-Salt"), []byte("OpenFIR-v2-S2C-AEAD"))
+	c2sKey := transport.HKDF(masterKey[:], []byte("OpenFIR-v2-Dir-Salt"), []byte("OpenFIR-v2-C2S-AEAD"))
+	s2cKey := transport.HKDF(masterKey[:], []byte("OpenFIR-v2-Dir-Salt"), []byte("OpenFIR-v2-S2C-AEAD"))
 
 	b1, err := aes.NewCipher(c2sKey[:])
 	if err != nil {
@@ -274,61 +254,7 @@ func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, u
 	return raw, seq, true
 }
 
-// ReplayWindow implements an 8192-packet ring-buffer sliding anti-replay window.
-type ReplayWindow struct {
-	mu      sync.Mutex
-	highest uint64
-	ring    [ReplayWindowWords]uint64
-	init    bool
-}
-
-func (rw *ReplayWindow) CheckAndAccept(seq uint64) bool {
-	if seq == 0 {
-		return false
-	}
-	rw.mu.Lock()
-	defer rw.mu.Unlock()
-
-	wordIdx := (seq >> 6) % ReplayWindowWords
-	bitMask := uint64(1) << (seq & 63)
-
-	if !rw.init {
-		rw.init = true
-		rw.highest = seq
-		rw.ring[wordIdx] = bitMask
-		return true
-	}
-
-	if seq > rw.highest {
-		oldWord := rw.highest >> 6
-		newWord := seq >> 6
-		if newWord > oldWord {
-			diffWords := newWord - oldWord
-			if diffWords >= ReplayWindowWords {
-				for i := 0; i < ReplayWindowWords; i++ {
-					rw.ring[i] = 0
-				}
-			} else {
-				for w := oldWord + 1; w <= newWord; w++ {
-					rw.ring[w%ReplayWindowWords] = 0
-				}
-			}
-		}
-		rw.ring[wordIdx] |= bitMask
-		rw.highest = seq
-		return true
-	}
-
-	diff := rw.highest - seq
-	if diff >= ReplayWindowBits-64 {
-		return false
-	}
-	if (rw.ring[wordIdx] & bitMask) != 0 {
-		return false
-	}
-	rw.ring[wordIdx] |= bitMask
-	return true
-}
+type ReplayWindow = transport.ReplayWindow
 
 // ============================================================================
 // Module 2: Compact Bitset (8x Memory Reduction vs []bool)
@@ -644,155 +570,6 @@ func unpackDirectoryBundle(bundleFile *os.File, bundleSize int64, targetRootDir 
 }
 
 // ============================================================================
-// Module 4: Kalman-Filtered One-Way Delay Gradient (KF-OWDG) & MicroPacer
-// ============================================================================
-
-type KalmanOWDTracker struct {
-	mu              sync.Mutex
-	initialized     bool
-	lastSendNano    int64
-	lastRecvNano    int64
-	minOneWayOffset int64
-	hatGradMicros   float64
-	errCovP         float64
-	processNoiseQ   float64
-	measureNoiseR   float64
-	standingQueueUs int64
-}
-
-func NewKalmanOWDTracker() *KalmanOWDTracker {
-	return &KalmanOWDTracker{
-		minOneWayOffset: math.MaxInt64,
-		errCovP:         100.0,
-		processNoiseQ:   8.0,
-		measureNoiseR:   220.0,
-	}
-}
-
-func (k *KalmanOWDTracker) Observe(sendNano, recvNano int64) {
-	if sendNano <= 0 || recvNano <= 0 {
-		return
-	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
-
-	oneWay := recvNano - sendNano
-	if oneWay < k.minOneWayOffset {
-		k.minOneWayOffset = oneWay
-	} else {
-		k.minOneWayOffset += (oneWay - k.minOneWayOffset) / 100000
-	}
-	k.standingQueueUs = (oneWay - k.minOneWayOffset) / 1000
-
-	if !k.initialized {
-		k.initialized = true
-		k.lastSendNano = sendNano
-		k.lastRecvNano = recvNano
-		return
-	}
-
-	if sendNano > k.lastSendNano {
-		deltaSend := sendNano - k.lastSendNano
-		deltaRecv := recvNano - k.lastRecvNano
-		measuredGradUs := float64(deltaRecv-deltaSend) / 1000.0
-
-		if measuredGradUs > -50000 && measuredGradUs < 50000 {
-			pPred := k.errCovP + k.processNoiseQ
-			kalmanGain := pPred / (pPred + k.measureNoiseR)
-			k.hatGradMicros = k.hatGradMicros + kalmanGain*(measuredGradUs-k.hatGradMicros)
-			k.errCovP = (1.0 - kalmanGain) * pPred
-		}
-		k.lastSendNano = sendNano
-		k.lastRecvNano = recvNano
-	}
-}
-
-func (k *KalmanOWDTracker) Snapshot() (gradMicros int64, queueMicros int64) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return int64(k.hatGradMicros), k.standingQueueUs
-}
-
-type MicroPacer struct {
-	mu           sync.Mutex
-	rateBps      float64
-	minRateBps   float64
-	maxRateBps   float64
-	tokens       float64
-	lastRefill   time.Time
-	maxBurstSize float64
-}
-
-func NewMicroPacer(initialMBps, minMBps, maxMBps float64) *MicroPacer {
-	initBps := initialMBps * 1024 * 1024
-	return &MicroPacer{
-		rateBps:      initBps,
-		minRateBps:   minMBps * 1024 * 1024,
-		maxRateBps:   maxMBps * 1024 * 1024,
-		tokens:       64 * 1024,
-		lastRefill:   time.Now(),
-		maxBurstSize: 64 * 1024,
-	}
-}
-
-func (p *MicroPacer) Wait(bytesToSend int) {
-	p.mu.Lock()
-	now := time.Now()
-	elapsed := now.Sub(p.lastRefill).Seconds()
-	p.lastRefill = now
-
-	p.tokens += elapsed * p.rateBps
-	if p.tokens > p.maxBurstSize {
-		p.tokens = p.maxBurstSize
-	}
-	p.tokens -= float64(bytesToSend)
-
-	var sleepDur time.Duration
-	if p.tokens < 0 {
-		waitSec := (-p.tokens) / p.rateBps
-		sleepDur = time.Duration(waitSec * float64(time.Second))
-	}
-	p.mu.Unlock()
-
-	if sleepDur > 400*time.Microsecond {
-		time.Sleep(sleepDur)
-	}
-}
-
-func (p *MicroPacer) UpdateFromKalman(gradMicros, standingQueueUs int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	const targetQueueUs = 4000
-
-	if gradMicros < 40 && standingQueueUs < targetQueueUs {
-		p.rateBps = p.rateBps*1.06 + 512*1024
-	} else if gradMicros > 180 || standingQueueUs > targetQueueUs*2 {
-		backoff := float64(gradMicros) / 4000.0
-		if backoff < 0.02 {
-			backoff = 0.02
-		}
-		if backoff > 0.15 {
-			backoff = 0.15
-		}
-		p.rateBps = p.rateBps * (1.0 - backoff)
-	}
-
-	if p.rateBps < p.minRateBps {
-		p.rateBps = p.minRateBps
-	}
-	if p.rateBps > p.maxRateBps {
-		p.rateBps = p.maxRateBps
-	}
-}
-
-func (p *MicroPacer) CurrentMBps() float64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.rateBps / (1024 * 1024)
-}
-
-// ============================================================================
 // Module 5: Gilbert-Elliott Burst-Loss Chaos Simulator
 // ============================================================================
 
@@ -923,7 +700,7 @@ type ReceiverSession struct {
 	fatalErr         error
 	completedAtNano  int64
 	lastActivityNano int64
-	kalman           *KalmanOWDTracker
+	kalman           *transport.KalmanOWDTracker
 	replay           ReplayWindow
 	pendingEquations []*ParityEquation
 	pendingTeleports map[uint32][]uint32
@@ -1569,7 +1346,7 @@ func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr)
 			finalOutputPath:  finalOutPath,
 			receivedBitmap:   NewCompactBitset(totalChunks),
 			lastActivityNano: time.Now().UnixNano(),
-			kalman:           NewKalmanOWDTracker(),
+			kalman:           transport.NewKalmanOWDTracker(),
 			pendingTeleports: make(map[uint32][]uint32),
 			startTime:        time.Now(),
 		}
@@ -1849,9 +1626,7 @@ func (sess *ReceiverSession) resolveEquation(eq *ParityEquation, tmpBuf []byte) 
 		if expLen <= 0 || !sess.readChunkFast(m, tmpBuf[:expLen]) {
 			return 0, nil, false
 		}
-		for b := 0; b < expLen; b++ {
-			healed[b] ^= tmpBuf[b]
-		}
+		transport.XOR(healed, tmpBuf[:expLen])
 	}
 
 	targetLen := expectedChunkLen(missingIdx, sess.totalChunks, sess.fileSize, sess.chunkSize)
@@ -2039,7 +1814,7 @@ type OpenFIRClient struct {
 	crypto      *WireCryptoEngine
 	replay      ReplayWindow
 	seqGen      uint64
-	pacer       *MicroPacer
+	pacer       *transport.MicroPacer
 	idleTimeout time.Duration
 	chaos       *ChaosSimulator
 }
@@ -2087,7 +1862,7 @@ func NewOpenFIRClient(cfg ClientConfig) (*OpenFIRClient, error) {
 		serverAddr:  raddr,
 		crypto:      cryptoEngine,
 		seqGen:      1,
-		pacer:       NewMicroPacer(cfg.InitMBps, 2.0, cfg.MaxMBps),
+		pacer:       transport.NewMicroPacer(cfg.InitMBps, 2.0, cfg.MaxMBps),
 		idleTimeout: cfg.IdleTimeout,
 		chaos:       cfg.Chaos,
 	}, nil
@@ -2105,7 +1880,7 @@ func (c *OpenFIRClient) sendCloaked(raw []byte) {
 	}
 	seq := atomic.AddUint64(&c.seqGen, 1)
 	wire := c.crypto.Seal(raw, DirClientToServer, seq)
-	connIdx := int(seq % uint64(len(c.conns)))
+	connIdx := transport.Path(seq, len(c.conns))
 	_, _ = c.conns[connIdx].WriteToUDP(wire, c.serverAddr)
 }
 
@@ -2561,11 +2336,9 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					members := make([]uint32, PhiGroupMembers)
 					xorPayload := make([]byte, chunkSize)
 					for m := 0; m < PhiGroupMembers; m++ {
-						pos := bucket + m*PhiStride
+						pos := transport.Member(bucket, m)
 						members[m] = windowIndices[pos]
-						for b := 0; b < chunkSize; b++ {
-							xorPayload[b] ^= windowChunks[pos][b]
-						}
+						transport.XOR(xorPayload, windowChunks[pos])
 					}
 					parityPkt := buildPhiParityPacket(transferID, members, xorPayload)
 					c.pacer.Wait(len(parityPkt))
@@ -3058,7 +2831,7 @@ func main() {
 	simLoss := flag.Float64("sim-loss", 0.0, "Simulated packet loss ratio (0.0 disables simulation in production)")
 	simBurst := flag.Int("sim-burst", 4, "Simulated contiguous burst drop length")
 	proxyDir := flag.String("proxy-dir", "openfir-proxy", "New directory for paired proxy profiles (proxy-init)")
-	proxyConfig := flag.String("proxy-config", "config.json", "Hysteria 2 configuration file (proxy-client or proxy-server)")
+	proxyConfig := flag.String("proxy-config", "config.json", "OpenFIR proxy configuration file (proxy-client or proxy-server)")
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "Local SOCKS5 TCP and UDP relay address (proxy-init)")
 	flag.Parse()
 
@@ -3077,7 +2850,7 @@ func main() {
 
 	switch *mode {
 	case "proxy-init":
-		if err := proxy.Init(*proxyDir, *serverAddr, *socksAddr); err != nil {
+		if err := proxy.Init(*proxyDir, *serverAddr, *socksAddr, *numSockets); err != nil {
 			fmt.Fprintln(os.Stderr, "[Proxy]", err)
 			os.Exit(1)
 		}
