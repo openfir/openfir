@@ -39,15 +39,16 @@ const (
 	ProtocolMagic1 = 0x46 // 'F'
 
 	PktHandshake       uint8 = 0x01 // Session metadata synchronization
-	PktHandshakeAck    uint8 = 0x02 // Idempotent handshake acknowledgment
+	PktHandshakeAck    uint8 = 0x02 // Handshake ACK + resume offset + 8192-bit CAS Bloom filter
 	PktData            uint8 = 0x03 // Standard data payload frame
-	PktTeleport        uint8 = 0x04 // In-flight content-addressed zero-byte teleport frame
+	PktTeleport        uint8 = 0x04 // Intra-session content-addressed zero-byte teleport frame
 	PktPhiParity       uint8 = 0x05 // Coprime-stride interleaved GF(2) parity frame
 	PktFeedback        uint8 = 0x06 // Receiver NACK bitmap + Kalman OWDG feedback frame
 	PktFin             uint8 = 0x07 // Transfer completion announcement
 	PktFinAck          uint8 = 0x08 // End-to-end SHA-256 verification confirmation
 	PktError           uint8 = 0x09 // Explicit fatal error notification frame
 	PktCookieChallenge uint8 = 0x0A // Stateless anti-spoofing HMAC cookie challenge
+	PktCASTeleport     uint8 = 0x0B // Cross-session global CAS zero-byte teleport frame
 
 	FlagSingleFile      uint8 = 0x00 // Payload represents a single regular file
 	FlagDirectoryBundle uint8 = 0x01 // Payload represents a Virtual Continuous Directory Extent
@@ -71,6 +72,9 @@ const (
 	MaxTrackedPeers         = 16               // Maximum concurrent client UDP paths tracked per session
 	L1ChunkCacheSize        = 512              // Receiver in-memory L1 ring cache slots
 	MaxTeleportIndexEntries = 500000           // Cap sender deduplication map to bound memory usage
+	MaxGlobalCASEntries     = 300000           // Cap server cross-session CAS index entries
+	CASBloomBytes           = 1024             // 8192-bit (1024-byte) cross-session CAS Bloom filter
+	SocketRotateByteQuota   = 12 * 1024 * 1024 // Rotate client 5-tuple socket every 12 MB transmitted
 	CookieSize              = 16               // 128-bit stateless handshake cookie size
 	OuterHeaderSize         = 18               // [6B Polymorphic Printable ASCII][8B MaskedSeq][4B RandSalt]
 	ReplayWindowWords       = 128              // 128 * 64 = 8192-packet sliding anti-replay window
@@ -125,7 +129,6 @@ func cryptoRandUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
-// hkdfSHA256 implements RFC 5869 Extract-and-Expand for 32-byte key derivation.
 func hkdfSHA256(ikm, salt, info []byte) [32]byte {
 	if len(salt) == 0 {
 		salt = make([]byte, sha256.Size)
@@ -144,7 +147,6 @@ func hkdfSHA256(ikm, salt, info []byte) [32]byte {
 	return out
 }
 
-// parseSecretMaterial validates and derives a 256-bit master key from user input.
 func parseSecretMaterial(raw string) ([32]byte, bool, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -221,9 +223,6 @@ func NewWireCryptoEngine(masterKey [32]byte) (*WireCryptoEngine, error) {
 	}, nil
 }
 
-// Seal encapsulates an inner frame into an authenticated wire datagram with a
-// per-packet polymorphic printable ASCII prefix (0x21..0x7E) and masked sequence number:
-// [6B Polymorphic Printable ASCII][8B Key-Masked Seq][4B CSPRNG-Salt][AES-256-GCM Ciphertext + 16B Tag]
 func (w *WireCryptoEngine) Seal(raw []byte, direction uint8, seq uint64) []byte {
 	var aead cipher.AEAD
 	if direction == DirClientToServer {
@@ -257,7 +256,6 @@ func (w *WireCryptoEngine) Seal(raw []byte, direction uint8, seq uint64) []byte 
 	return out
 }
 
-// Open verifies the 6-byte polymorphic printable-ASCII header, direction parity, and AES-256-GCM tag.
 func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, uint64, bool) {
 	var aead cipher.AEAD
 	if expectedDirection == DirClientToServer {
@@ -300,7 +298,6 @@ func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, u
 	return raw, seq, true
 }
 
-// ReplayWindow implements an 8192-packet ring-buffer sliding anti-replay window.
 type ReplayWindow struct {
 	mu      sync.Mutex
 	highest uint64
@@ -357,7 +354,7 @@ func (rw *ReplayWindow) CheckAndAccept(seq uint64) bool {
 }
 
 // ============================================================================
-// Module 2: Compact Bitset (8x Memory Reduction vs []bool)
+// Module 2: Compact Bitset & Cross-Session Persistent Global CAS Store
 // ============================================================================
 
 type CompactBitset struct {
@@ -394,9 +391,138 @@ func (b *CompactBitset) Clear(idx uint32) {
 	b.words[idx>>6] &^= (uint64(1) << (idx & 63))
 }
 
+func casBloomAdd(bloom *[CASBloomBytes]byte, h [32]byte) {
+	for i := 0; i < 8; i += 2 {
+		bit := binary.BigEndian.Uint16(h[i:i+2]) & 8191
+		bloom[bit>>3] |= (1 << (bit & 7))
+	}
+}
+
+func casBloomTest(bloom *[CASBloomBytes]byte, h [32]byte) bool {
+	for i := 0; i < 8; i += 2 {
+		bit := binary.BigEndian.Uint16(h[i:i+2]) & 8191
+		if (bloom[bit>>3] & (1 << (bit & 7))) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+type casChunkLocation struct {
+	filePath string
+	offset   int64
+	length   int
+}
+
+type GlobalCASStore struct {
+	mu      sync.RWMutex
+	entries map[[32]byte]casChunkLocation
+	bloom   [CASBloomBytes]byte
+}
+
+func NewGlobalCASStore(rootDir string) *GlobalCASStore {
+	store := &GlobalCASStore{
+		entries: make(map[[32]byte]casChunkLocation),
+	}
+	// Pre-index existing completed files in outputDir on startup
+	_ = filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		base := filepath.Base(path)
+		if strings.HasPrefix(base, ".") && strings.Contains(base, ".openfir-part-") {
+			return nil
+		}
+		store.IndexPath(path)
+		return nil
+	})
+	return store
+}
+
+func (g *GlobalCASStore) IndexPath(targetPath string) {
+	st, err := os.Stat(targetPath)
+	if err != nil {
+		return
+	}
+	if st.IsDir() {
+		_ = filepath.WalkDir(targetPath, func(p string, d fs.DirEntry, wErr error) error {
+			if wErr != nil || d.IsDir() {
+				return nil
+			}
+			g.indexSingleFile(p)
+			return nil
+		})
+		return
+	}
+	if st.Mode().IsRegular() {
+		g.indexSingleFile(targetPath)
+	}
+}
+
+func (g *GlobalCASStore) indexSingleFile(filePath string) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	buf := make([]byte, DefaultChunkSize)
+	var offset int64 = 0
+	for {
+		n, rErr := f.ReadAt(buf, offset)
+		if n > 0 {
+			h := sha256.Sum256(buf[:n])
+			g.mu.Lock()
+			if len(g.entries) < MaxGlobalCASEntries {
+				g.entries[h] = casChunkLocation{
+					filePath: filePath,
+					offset:   offset,
+					length:   n,
+				}
+				casBloomAdd(&g.bloom, h)
+			}
+			g.mu.Unlock()
+			offset += int64(n)
+		}
+		if rErr != nil {
+			break
+		}
+	}
+}
+
+func (g *GlobalCASStore) SnapshotBloom() (uint32, [CASBloomBytes]byte) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return uint32(len(g.entries)), g.bloom
+}
+
+func (g *GlobalCASStore) ReadVerifiedChunk(digest [32]byte, expectedLen int) ([]byte, bool) {
+	g.mu.RLock()
+	loc, exists := g.entries[digest]
+	g.mu.RUnlock()
+	if !exists || loc.length != expectedLen || expectedLen <= 0 {
+		return nil, false
+	}
+
+	f, err := os.Open(loc.filePath)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	buf := make([]byte, expectedLen)
+	n, err := f.ReadAt(buf, loc.offset)
+	if (err != nil && err != io.EOF) || n != expectedLen {
+		return nil, false
+	}
+	if sha256.Sum256(buf) != digest {
+		return nil, false
+	}
+	return buf, true
+}
+
 // ============================================================================
 // Module 3: Zero-RTT Virtual Continuous Extent (Massive Small-Files Engine)
-// Entry Format: [4B "OFEN"][1B EntryType][4B Mode][8B FileSize][2B PathLen][SlashPath][Data...]
 // ============================================================================
 
 type virtualEntry struct {
@@ -869,7 +995,7 @@ func (c *ChaosSimulator) ShouldDrop() bool {
 }
 
 // ============================================================================
-// Deterministic Chunk Geometry & Socket Helpers
+// Deterministic Chunk Geometry & Low-Ephemeral Socket Binding Helpers
 // ============================================================================
 
 func expectedChunkLen(idx, totalChunks uint32, fileSize int64, chunkSize int) int {
@@ -889,6 +1015,34 @@ func expectedChunkLen(idx, totalChunks uint32, fileSize int64, chunkSize int) in
 func tuneUDPConn(conn *net.UDPConn) {
 	_ = conn.SetReadBuffer(SocketBufferBytes)
 	_ = conn.SetWriteBuffer(SocketBufferBytes)
+}
+
+// bindClientUDPSocket preferentially allocates client UDP sockets in the low
+// non-privileged port band [10000..32000] so SrcPort <= DstPort holds against
+// high server ports, falling back to OS ephemeral (:0) if constrained.
+func bindClientUDPSocket() (*net.UDPConn, error) {
+	for attempt := 0; attempt < 12; attempt++ {
+		port := 10000 + int(cryptoRandUint32()%22000)
+		laddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			continue
+		}
+		conn, err := net.ListenUDP("udp", laddr)
+		if err == nil {
+			tuneUDPConn(conn)
+			return conn, nil
+		}
+	}
+	laddr, err := net.ResolveUDPAddr("udp", ":0")
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return nil, err
+	}
+	tuneUDPConn(conn)
+	return conn, nil
 }
 
 func atomicReplaceFile(stagingPath, finalPath string, allowOverwrite bool) error {
@@ -953,15 +1107,17 @@ type ReceiverSession struct {
 	replay           ReplayWindow
 	pendingEquations []*ParityEquation
 	pendingTeleports map[uint32][]uint32
+	urgentNacks      []uint32
 	l1Cache          [L1ChunkCacheSize]l1CacheSlot
 	peers            []trackedPeer
 	feedbackTurn     uint64
 
-	statsDataChunks     uint64
-	statsTeleportChunks uint64
-	statsParityHealed   uint64
-	statsDuplicatePkts  uint64
-	startTime           time.Time
+	statsDataChunks        uint64
+	statsTeleportChunks    uint64
+	statsCASTeleportChunks uint64
+	statsParityHealed      uint64
+	statsDuplicatePkts     uint64
+	startTime              time.Time
 }
 
 func (sess *ReceiverSession) touchActivity() {
@@ -1097,6 +1253,7 @@ func (sess *ReceiverSession) abortAndCleanup() {
 	sess.receivedBitmap = nil
 	sess.pendingEquations = nil
 	sess.pendingTeleports = nil
+	sess.urgentNacks = nil
 	sess.mu.Unlock()
 
 	if f != nil {
@@ -1129,6 +1286,7 @@ type OpenFIRServer struct {
 	outputDir      string
 	crypto         *WireCryptoEngine
 	cookieSecret   [32]byte
+	casStore       *GlobalCASStore
 	allowOverwrite bool
 	maxFileSize    int64
 	maxSessions    int
@@ -1178,6 +1336,7 @@ func NewOpenFIRServer(cfg ServerConfig) (*OpenFIRServer, error) {
 		outputDir:      cfg.OutputDir,
 		crypto:         cryptoEngine,
 		cookieSecret:   cookieSeed,
+		casStore:       NewGlobalCASStore(cfg.OutputDir),
 		allowOverwrite: cfg.AllowOverwrite,
 		maxFileSize:    cfg.MaxFileSize,
 		maxSessions:    cfg.MaxSessions,
@@ -1413,6 +1572,12 @@ func (s *OpenFIRServer) Serve(targetCompletions int) error {
 						checkTargetReached()
 					}
 
+				case PktCASTeleport:
+					s.handleCASTeleport(sess, payload, item.recvNano)
+					if sess.checkAndFinalize(s, peer) {
+						checkTargetReached()
+					}
+
 				case PktPhiParity:
 					s.handlePhiParity(sess, payload)
 					if sess.checkAndFinalize(s, peer) {
@@ -1609,7 +1774,10 @@ func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr)
 	sess.touchActivity()
 	sess.registerPeer(peer)
 
-	ack := make([]byte, 15)
+	casCount, casBloom := s.casStore.SnapshotBloom()
+
+	// Layout: [Magic 2B][Type 1B][8B TxID][4B HighestContig][4B CASEntryCount][1024B CASBloomFilter]
+	ack := make([]byte, 19+CASBloomBytes)
 	ack[0] = ProtocolMagic0
 	ack[1] = ProtocolMagic1
 	ack[2] = PktHandshakeAck
@@ -1618,6 +1786,8 @@ func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr)
 	hc := sess.highestContig
 	sess.mu.Unlock()
 	binary.BigEndian.PutUint32(ack[11:15], hc)
+	binary.BigEndian.PutUint32(ack[15:19], casCount)
+	copy(ack[19:19+CASBloomBytes], casBloom[:])
 	s.sendCloaked(ack, peer)
 
 	if sess.totalChunks == 0 {
@@ -1678,6 +1848,49 @@ func (s *OpenFIRServer) handleTeleport(sess *ReceiverSession, p []byte, recvNano
 	if sess.readChunkFast(sourceIdx, buf) {
 		sess.commitChunkIterative(targetIdx, buf, "teleport")
 	}
+}
+
+func (s *OpenFIRServer) handleCASTeleport(sess *ReceiverSession, p []byte, recvNano int64) {
+	// Layout: [4B TargetIdx][32B FullSHA256][8B SendNano]
+	if len(p) < 44 {
+		return
+	}
+	targetIdx := binary.BigEndian.Uint32(p[0:4])
+	var digest [32]byte
+	copy(digest[:], p[4:36])
+	sendNano := int64(binary.BigEndian.Uint64(p[36:44]))
+
+	sess.kalman.Observe(sendNano, recvNano)
+
+	if targetIdx >= sess.totalChunks {
+		return
+	}
+
+	sess.mu.Lock()
+	if sess.completed || sess.receivedBitmap == nil || sess.receivedBitmap.Get(targetIdx) {
+		sess.mu.Unlock()
+		return
+	}
+	sess.mu.Unlock()
+
+	expLen := expectedChunkLen(targetIdx, sess.totalChunks, sess.fileSize, sess.chunkSize)
+	if expLen <= 0 {
+		return
+	}
+
+	if chunkBytes, ok := s.casStore.ReadVerifiedChunk(digest, expLen); ok {
+		sess.commitChunkIterative(targetIdx, chunkBytes, "cas")
+		return
+	}
+
+	// On Bloom filter false positive or stale CAS entry, queue urgent NACK for immediate raw fallback
+	sess.mu.Lock()
+	if !sess.completed && sess.receivedBitmap != nil && !sess.receivedBitmap.Get(targetIdx) {
+		if len(sess.urgentNacks) < MaxNackPerPacket {
+			sess.urgentNacks = append(sess.urgentNacks, targetIdx)
+		}
+	}
+	sess.mu.Unlock()
 }
 
 func (s *OpenFIRServer) handlePhiParity(sess *ReceiverSession, p []byte) {
@@ -1763,6 +1976,8 @@ func (sess *ReceiverSession) commitChunkIterative(initialIdx uint32, initialData
 			sess.statsDataChunks++
 		case "teleport":
 			sess.statsTeleportChunks++
+		case "cas":
+			sess.statsCASTeleportChunks++
 		case "parity":
 			sess.statsParityHealed++
 		}
@@ -1895,6 +2110,15 @@ func (s *OpenFIRServer) sendFeedback(sess *ReceiverSession, peer *net.UDPAddr) {
 	total := sess.totalChunks
 
 	var nacks []uint32
+	if len(sess.urgentNacks) > 0 {
+		for _, uIdx := range sess.urgentNacks {
+			if uIdx >= hc && uIdx < total && !sess.receivedBitmap.Get(uIdx) && len(nacks) < MaxNackPerPacket {
+				nacks = append(nacks, uIdx)
+			}
+		}
+		sess.urgentNacks = sess.urgentNacks[:0]
+	}
+
 	scanIdx := hc
 	maxScan := hc + FeedbackScanWindow
 	if maxScan > total || maxScan < hc {
@@ -1971,6 +2195,7 @@ func (sess *ReceiverSession) checkAndFinalize(s *OpenFIRServer, fallbackPeer *ne
 				commitErr = err
 			} else {
 				extractedFiles = cnt
+				s.casStore.IndexPath(sess.finalOutputPath)
 			}
 		} else {
 			_ = f.Close()
@@ -1978,6 +2203,8 @@ func (sess *ReceiverSession) checkAndFinalize(s *OpenFIRServer, fallbackPeer *ne
 				_ = os.Remove(sess.stagingPath)
 				hashMatch = false
 				commitErr = err
+			} else {
+				s.casStore.IndexPath(sess.finalOutputPath)
 			}
 		}
 	} else {
@@ -1993,6 +2220,7 @@ func (sess *ReceiverSession) checkAndFinalize(s *OpenFIRServer, fallbackPeer *ne
 	sess.receivedBitmap = nil
 	sess.pendingEquations = nil
 	sess.pendingTeleports = nil
+	sess.urgentNacks = nil
 	tid := sess.transferID
 
 	elapsed := time.Since(sess.startTime).Seconds()
@@ -2004,8 +2232,8 @@ func (sess *ReceiverSession) checkAndFinalize(s *OpenFIRServer, fallbackPeer *ne
 	fmt.Printf("[Server] Transfer Complete! Target: %s (%.2f MB, %d item(s))\n",
 		sess.finalOutputPath, float64(sess.fileSize)/(1024*1024), extractedFiles)
 	fmt.Printf("  ├─ Elapsed & Goodput : %.3f s (Effective Goodput: %.2f MB/s)\n", elapsed, mbps)
-	fmt.Printf("  ├─ Chunk Breakdown   : Data=%d | Teleported=%d | PhiParityHealed=%d\n",
-		sess.statsDataChunks, sess.statsTeleportChunks, sess.statsParityHealed)
+	fmt.Printf("  ├─ Chunk Breakdown   : Data=%d | Teleported=%d | CASTeleported=%d | PhiParityHealed=%d\n",
+		sess.statsDataChunks, sess.statsTeleportChunks, sess.statsCASTeleportChunks, sess.statsParityHealed)
 	fmt.Printf("  └─ SHA-256 Verified  : %v (%s...)\n", sess.verifiedOK, hex.EncodeToString(actualHash[:8]))
 	if commitErr != nil {
 		fmt.Printf("  └─ Commit Error      : %v\n", commitErr)
@@ -2043,7 +2271,7 @@ func (s *OpenFIRServer) broadcastFinAck(sess *ReceiverSession, tid uint64, verif
 }
 
 // ============================================================================
-// Module 7: OpenFIR Multi-Path Sender Engine
+// Module 7: OpenFIR Multi-Path Sender Engine (with Self-Healing Port Rotation)
 // ============================================================================
 
 type ClientConfig struct {
@@ -2057,14 +2285,17 @@ type ClientConfig struct {
 }
 
 type OpenFIRClient struct {
-	conns       []*net.UDPConn
-	serverAddr  *net.UDPAddr
-	crypto      *WireCryptoEngine
-	replay      ReplayWindow
-	seqGen      uint64
-	pacer       *MicroPacer
-	idleTimeout time.Duration
-	chaos       *ChaosSimulator
+	connMu       sync.RWMutex
+	conns        []*net.UDPConn
+	retiredConns []*net.UDPConn
+	socketBytes  []uint64
+	serverAddr   *net.UDPAddr
+	crypto       *WireCryptoEngine
+	replay       ReplayWindow
+	seqGen       uint64
+	pacer        *MicroPacer
+	idleTimeout  time.Duration
+	chaos        *ChaosSimulator
 }
 
 func NewOpenFIRClient(cfg ClientConfig) (*OpenFIRClient, error) {
@@ -2088,25 +2319,18 @@ func NewOpenFIRClient(cfg ClientConfig) (*OpenFIRClient, error) {
 
 	conns := make([]*net.UDPConn, 0, cfg.NumSockets)
 	for i := 0; i < cfg.NumSockets; i++ {
-		laddr, err := net.ResolveUDPAddr("udp", ":0")
+		conn, err := bindClientUDPSocket()
 		if err != nil {
 			for _, c := range conns {
 				_ = c.Close()
 			}
 			return nil, err
 		}
-		conn, err := net.ListenUDP("udp", laddr)
-		if err != nil {
-			for _, c := range conns {
-				_ = c.Close()
-			}
-			return nil, err
-		}
-		tuneUDPConn(conn)
 		conns = append(conns, conn)
 	}
 	return &OpenFIRClient{
 		conns:       conns,
+		socketBytes: make([]uint64, len(conns)),
 		serverAddr:  raddr,
 		crypto:      cryptoEngine,
 		seqGen:      1,
@@ -2117,19 +2341,44 @@ func NewOpenFIRClient(cfg ClientConfig) (*OpenFIRClient, error) {
 }
 
 func (c *OpenFIRClient) Close() {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 	for _, conn := range c.conns {
+		_ = conn.Close()
+	}
+	for _, conn := range c.retiredConns {
 		_ = conn.Close()
 	}
 }
 
-func (c *OpenFIRClient) sendCloaked(raw []byte) {
+func (c *OpenFIRClient) sendCloaked(raw []byte, onRotate func(*net.UDPConn)) {
 	if c.chaos != nil && c.chaos.ShouldDrop() {
 		return
 	}
 	seq := atomic.AddUint64(&c.seqGen, 1)
 	wire := c.crypto.Seal(raw, DirClientToServer, seq)
+
+	c.connMu.RLock()
 	connIdx := int(seq % uint64(len(c.conns)))
-	_, _ = c.conns[connIdx].WriteToUDP(wire, c.serverAddr)
+	conn := c.conns[connIdx]
+	newBytes := atomic.AddUint64(&c.socketBytes[connIdx], uint64(len(wire)))
+	c.connMu.RUnlock()
+
+	_, _ = conn.WriteToUDP(wire, c.serverAddr)
+
+	// Self-healing ephemeral 5-tuple rotation when socket reaches byte quota
+	if newBytes >= SocketRotateByteQuota && onRotate != nil {
+		if atomic.CompareAndSwapUint64(&c.socketBytes[connIdx], newBytes, 0) {
+			if freshConn, err := bindClientUDPSocket(); err == nil {
+				c.connMu.Lock()
+				oldConn := c.conns[connIdx]
+				c.conns[connIdx] = freshConn
+				c.retiredConns = append(c.retiredConns, oldConn)
+				c.connMu.Unlock()
+				onRotate(freshConn)
+			}
+		}
+	}
 }
 
 func (c *OpenFIRClient) sendError(tid uint64, msg string) {
@@ -2147,7 +2396,10 @@ func (c *OpenFIRClient) sendError(tid uint64, msg string) {
 	copy(pkt[14:], msgBytes)
 	seq := atomic.AddUint64(&c.seqGen, 1)
 	wire := c.crypto.Seal(pkt, DirClientToServer, seq)
-	_, _ = c.conns[0].WriteToUDP(wire, c.serverAddr)
+	c.connMu.RLock()
+	conn := c.conns[0]
+	c.connMu.RUnlock()
+	_, _ = conn.WriteToUDP(wire, c.serverAddr)
 }
 
 func computeExtentSHA256(r io.ReaderAt, totalSize int64) ([32]byte, error) {
@@ -2235,6 +2487,8 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 	var remoteRecvCount uint32
 	retransmitQueue := make([]uint32, 0, 1024)
 	var serverCookie [CookieSize]byte
+	var serverCASBloom [CASBloomBytes]byte
+	hasServerCAS := false
 	cookieReady := make(chan struct{}, 1)
 	handshakeDone := false
 	transferFinAcked := false
@@ -2245,9 +2499,10 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 
 	stopRecv := make(chan struct{})
 	var recvWG sync.WaitGroup
-	for _, sock := range c.conns {
+
+	spawnSocketReader := func(conn *net.UDPConn) {
 		recvWG.Add(1)
-		go func(conn *net.UDPConn) {
+		go func(sock *net.UDPConn) {
 			defer recvWG.Done()
 			buf := make([]byte, MaxUDPDatagramSize)
 			for {
@@ -2256,8 +2511,8 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					return
 				default:
 				}
-				_ = conn.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
-				n, _, err := conn.ReadFromUDP(buf)
+				_ = sock.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
+				n, _, err := sock.ReadFromUDP(buf)
 				if err != nil {
 					continue
 				}
@@ -2298,6 +2553,13 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 						stateMu.Lock()
 						handshakeDone = true
 						lastServerContact = time.Now()
+						if len(p) >= 8+CASBloomBytes {
+							casCnt := binary.BigEndian.Uint32(p[4:8])
+							if casCnt > 0 {
+								copy(serverCASBloom[:], p[8:8+CASBloomBytes])
+								hasServerCAS = true
+							}
+						}
 						if ackHc > highestContig && ackHc <= totalChunks {
 							for idx := highestContig; idx < ackHc; idx++ {
 								ackedBitmap.Set(idx)
@@ -2388,8 +2650,15 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					}
 				}
 			}
-		}(sock)
+		}(conn)
 	}
+
+	c.connMu.RLock()
+	for _, sock := range c.conns {
+		spawnSocketReader(sock)
+	}
+	c.connMu.RUnlock()
+
 	defer func() {
 		close(stopRecv)
 		recvWG.Wait()
@@ -2411,7 +2680,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 			break
 		}
 		hsPkt := buildHandshakePacket(transferID, cookieCopy, totalSize, chunkSize, totalChunks, streamSHA256, flags, baseName)
-		c.sendCloaked(hsPkt)
+		c.sendCloaked(hsPkt, nil)
 
 		select {
 		case <-cookieReady:
@@ -2430,10 +2699,13 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 		return errors.New("handshake timeout: peer unreachable or secret key mismatch")
 	}
 	nextChunk := highestContig
+	useCAS := hasServerCAS
+	casBloomCopy := serverCASBloom
 	stateMu.Unlock()
 
 	contentHashToChunk := make(map[[32]byte]uint32)
 	var teleportSentCount uint64
+	var casTeleportSentCount uint64
 	var phiParitySentCount uint64
 
 	windowChunks := make([][]byte, PhiWindowSize)
@@ -2508,8 +2780,8 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 			if !verified {
 				return errors.New("end-to-end SHA-256 verification failed on receiver")
 			}
-			fmt.Printf("[Client] Transfer 100%% verified! (TeleportCmds=%d, PhiParityFrames=%d, Rate=%.2f MB/s)\n",
-				teleportSentCount, phiParitySentCount, c.pacer.CurrentMBps())
+			fmt.Printf("[Client] Transfer 100%% verified! (TeleportCmds=%d, CASTeleportCmds=%d, PhiParityFrames=%d, Rate=%.2f MB/s)\n",
+				teleportSentCount, casTeleportSentCount, phiParitySentCount, c.pacer.CurrentMBps())
 			return nil
 		}
 
@@ -2531,12 +2803,12 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 				}
 				pkt := buildDataPacket(transferID, nackIdx, readBuf[:expLen])
 				c.pacer.Wait(len(pkt))
-				c.sendCloaked(pkt)
+				c.sendCloaked(pkt, spawnSocketReader)
 			}
 			continue
 		}
 
-		// Priority 2: First-pass transmission
+		// Priority 2: First-pass transmission (Intra-Session Teleport -> Cross-Session CAS Teleport -> Raw Data)
 		if nextChunk < totalChunks {
 			idx := nextChunk
 			nextChunk++
@@ -2565,12 +2837,17 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 			if seenBefore && prevIdx < idx {
 				tpPkt := buildTeleportPacket(transferID, idx, prevIdx)
 				c.pacer.Wait(len(tpPkt))
-				c.sendCloaked(tpPkt)
+				c.sendCloaked(tpPkt, spawnSocketReader)
 				teleportSentCount++
+			} else if useCAS && casBloomTest(&casBloomCopy, chunkHash) {
+				casPkt := buildCASTeleportPacket(transferID, idx, chunkHash)
+				c.pacer.Wait(len(casPkt))
+				c.sendCloaked(casPkt, spawnSocketReader)
+				casTeleportSentCount++
 			} else {
 				dataPkt := buildDataPacket(transferID, idx, chunkData)
 				c.pacer.Wait(len(dataPkt))
-				c.sendCloaked(dataPkt)
+				c.sendCloaked(dataPkt, spawnSocketReader)
 			}
 
 			padded := make([]byte, chunkSize)
@@ -2592,7 +2869,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					}
 					parityPkt := buildPhiParityPacket(transferID, members, xorPayload)
 					c.pacer.Wait(len(parityPkt))
-					c.sendCloaked(parityPkt)
+					c.sendCloaked(parityPkt, spawnSocketReader)
 					phiParitySentCount++
 				}
 				windowFill = 0
@@ -2613,7 +2890,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					}
 					parityPkt := buildPhiParityPacket(transferID, members, xorPayload)
 					c.pacer.Wait(len(parityPkt))
-					c.sendCloaked(parityPkt)
+					c.sendCloaked(parityPkt, spawnSocketReader)
 					phiParitySentCount++
 				}
 				windowFill = 0
@@ -2654,7 +2931,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					}
 					pkt := buildDataPacket(transferID, targetIdx, readBuf[:expLen])
 					c.pacer.Wait(len(pkt))
-					c.sendCloaked(pkt)
+					c.sendCloaked(pkt, spawnSocketReader)
 				}
 			} else {
 				time.Sleep(4 * time.Millisecond)
@@ -2666,7 +2943,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 				finPkt[1] = ProtocolMagic1
 				finPkt[2] = PktFin
 				binary.BigEndian.PutUint64(finPkt[3:11], transferID)
-				c.sendCloaked(finPkt)
+				c.sendCloaked(finPkt, nil)
 				lastFinSendTime = time.Now()
 				if finBackoff < 120*time.Millisecond {
 					finBackoff += 15 * time.Millisecond
@@ -2724,6 +3001,18 @@ func buildTeleportPacket(tid uint64, targetIdx, sourceIdx uint32) []byte {
 	return pkt
 }
 
+func buildCASTeleportPacket(tid uint64, targetIdx uint32, digest [32]byte) []byte {
+	pkt := make([]byte, 3+8+44)
+	pkt[0] = ProtocolMagic0
+	pkt[1] = ProtocolMagic1
+	pkt[2] = PktCASTeleport
+	binary.BigEndian.PutUint64(pkt[3:11], tid)
+	binary.BigEndian.PutUint32(pkt[11:15], targetIdx)
+	copy(pkt[15:47], digest[:])
+	binary.BigEndian.PutUint64(pkt[47:55], uint64(time.Now().UnixNano()))
+	return pkt
+}
+
 func buildPhiParityPacket(tid uint64, members []uint32, xorPayload []byte) []byte {
 	count := len(members)
 	pkt := make([]byte, 3+8+1+count*4+2+len(xorPayload))
@@ -2774,7 +3063,7 @@ func sendOversizedUDPProbes(targetAddr string) error {
 
 func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	fmt.Printf("====================================================================\n")
-	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.3.0)\n")
+	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.4.0)\n")
 	fmt.Printf("  Injected Channel Conditions: LossRate=%.1f%% | MeanBurstLength=%d | Sockets=%d\n",
 		lossRate*100, burstLen, numSockets)
 	fmt.Printf("====================================================================\n")
@@ -2813,7 +3102,7 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 
 	var totalDropped uint64
 	for iter := 1; iter <= 3; iter++ {
-		fmt.Printf("\n--- [Suite 1/3 - Iteration %d/3] Single Large File Transfer (16.00 MB) ---\n", iter)
+		fmt.Printf("\n--- [Suite 1/4 - Iteration %d/3] Single Large File Transfer (16.00 MB) ---\n", iter)
 		srv1, err := NewOpenFIRServer(ServerConfig{
 			ListenAddr:     "127.0.0.1:0",
 			OutputDir:      outDir,
@@ -2870,7 +3159,7 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	// ------------------------------------------------------------------------
 	// Suite 2: 200 Small Files + Empty Subdirectory via Zero-RTT Virtual Extent
 	// ------------------------------------------------------------------------
-	fmt.Printf("\n--- [Suite 2/3] Massive Small-Files Directory Tree (200 files) ---\n")
+	fmt.Printf("\n--- [Suite 2/4] Massive Small-Files Directory Tree (200 files) ---\n")
 	srcSmallDir := filepath.Join(tmpDir, "small_files_dataset")
 	expectedSmallFiles := make(map[string][]byte)
 	sharedSmallTemplate := make([]byte, 4096)
@@ -2963,7 +3252,7 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	// ------------------------------------------------------------------------
 	// Suite 3: Concurrent Multi-Client Isolation Test (Client A & Client B)
 	// ------------------------------------------------------------------------
-	fmt.Printf("\n--- [Suite 3/3] Concurrent Multi-Client Isolation Test ---\n")
+	fmt.Printf("\n--- [Suite 3/4] Concurrent Multi-Client Isolation Test ---\n")
 	fileA := filepath.Join(tmpDir, "concurrent_A.bin")
 	fileB := filepath.Join(tmpDir, "concurrent_B.bin")
 	bytesA := make([]byte, 4*1024*1024)
@@ -3054,7 +3343,65 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 		return errors.New("suite 3 failure: concurrent_B.bin corrupted")
 	}
 
-	fmt.Printf("\n[SelfTest] ALL SUITES PASSED 100%%! (Total dropped packets recovered: %d)\n", totalDropped)
+	// ------------------------------------------------------------------------
+	// Suite 4: Cross-Session Persistent CAS Instant Teleportation Test
+	// ------------------------------------------------------------------------
+	fmt.Printf("\n--- [Suite 4/4] Cross-Session Persistent CAS Instant Teleportation ---\n")
+	v2File := filepath.Join(tmpDir, "incremental_v2.bin")
+	// Construct an 8 MB v2 file that shares 85% of chunks with already-received concurrent_A.bin & test_payload.bin
+	v2Bytes := make([]byte, 8*1024*1024)
+	copy(v2Bytes[0:4*1024*1024], bytesA)
+	copy(v2Bytes[4*1024*1024:8*1024*1024], rawFileBytes[0:4*1024*1024])
+	// Mutate 15% of the blocks with fresh random content
+	_, _ = rand.Read(v2Bytes[1024*1024 : 2*1024*1024])
+	if err := os.WriteFile(v2File, v2Bytes, 0644); err != nil {
+		return err
+	}
+
+	srv4, err := NewOpenFIRServer(ServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		OutputDir:      outDir,
+		MasterKey:      testMasterKey,
+		AllowOverwrite: true,
+	})
+	if err != nil {
+		return err
+	}
+	srv4Err := make(chan error, 1)
+	go func() { srv4Err <- srv4.Serve(1) }()
+
+	chaos4 := NewChaosSimulator(lossRate, burstLen)
+	cli4, err := NewOpenFIRClient(ClientConfig{
+		ServerAddr: srv4.LocalAddr(),
+		MasterKey:  testMasterKey,
+		NumSockets: numSockets,
+		InitMBps:   80.0,
+		MaxMBps:    500.0,
+		Chaos:      chaos4,
+	})
+	if err != nil {
+		srv4.Close()
+		return err
+	}
+	if err := cli4.SendFile(v2File); err != nil {
+		cli4.Close()
+		srv4.Close()
+		return err
+	}
+	cli4.Close()
+	if err := <-srv4Err; err != nil {
+		srv4.Close()
+		return err
+	}
+	srv4.Close()
+	totalDropped += chaos4.droppedCount
+
+	gotV2, err := os.ReadFile(filepath.Join(outDir, "incremental_v2.bin"))
+	if err != nil || !bytes.Equal(v2Bytes, gotV2) {
+		return errors.New("suite 4 failure: incremental_v2.bin content mismatch after cross-session CAS teleportation")
+	}
+
+	fmt.Printf("\n[SelfTest] ALL 4 SUITES PASSED 100%%! (Total dropped packets recovered: %d)\n", totalDropped)
 	return nil
 }
 
@@ -3081,7 +3428,7 @@ func main() {
 	flag.Parse()
 
 	if *mode == "" {
-		fmt.Fprintf(os.Stderr, "OpenFIR v0.3.0 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
+		fmt.Fprintf(os.Stderr, "OpenFIR v0.4.0 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  Run self-test : openfir -mode selftest\n")
 		fmt.Fprintf(os.Stderr, "  Start server  : openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret <64-hex-chars>\n")
@@ -3123,7 +3470,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Error] Failed to initialize server: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("[Server] OpenFIR v0.3.0 listening on %s (output dir: %s, overwrite: %v)\n",
+		fmt.Printf("[Server] OpenFIR v0.4.0 listening on %s (output dir: %s, overwrite: %v)\n",
 			srv.LocalAddr(), *outDir, *overwrite)
 		if err := srv.Serve(0); err != nil {
 			fmt.Fprintf(os.Stderr, "[Error] Server runtime error: %v\n", err)
