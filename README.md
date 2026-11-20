@@ -3,16 +3,17 @@
 
 **OpenFIR** (**Open** **F**ast **I**nterleaved **R**eliable Transport Protocol) is a high-performance, multi-path, delay-gradient controlled, algebraically self-healing UDP file and directory transfer engine written in pure Go with zero external dependencies.
 
-Engineered for high Bandwidth-Delay Product (BDP) wide-area networks, transcontinental links, satellite backhauls, and lossy wireless channels, OpenFIR decouples congestion control from random packet loss while eliminating retransmission round-trip penalties through coprime-stride erasure interleaving, intra-session and cross-session content-addressed zero-byte teleportation, zero-RTT virtual continuous directory extents, and self-healing multi-socket 5-tuple striping.
+Engineered for high Bandwidth-Delay Product (BDP) wide-area networks, transcontinental links, satellite backhauls, and lossy wireless channels, OpenFIR decouples congestion control from random packet loss while eliminating retransmission round-trip penalties through inline coprime-stride erasure interleaving, intra-session and cross-session content-addressed zero-byte teleportation, zero-RTT virtual continuous directory extents, and self-healing multi-socket 5-tuple striping.
 
 ---
 
 ## Core Architectural Innovations
 
-### 1. $\phi$-Parity Coprime-Stride Interleaving & Belief-Propagation Peeling Decoder
-Conventional Forward Error Correction (FEC) schemes group contiguous packets into block parity equations, which fail when network links experience Gilbert-Elliott contiguous burst losses.
-* **Coprime Stride Interleaving:** OpenFIR weaves GF(2) algebraic parity equations (`PKT_PHI_PARITY`) across non-adjacent chunks separated by a coprime stride $S$ within a sliding window $W$. Any contiguous burst loss of up to $S$ packets impacts at most **one** symbol per algebraic equation.
-* **Real-Time Iterative Peeling Decoder:** The receiver maintains an in-memory bipartite graph of pending parity equations backed by an L1 chunk ring cache. When an incoming data chunk or parity frame reduces an equation's unknown degree to $1$, the receiver immediately reconstructs the missing chunk via $O(1)$ XOR elimination and triggers an iterative breadth-first cascade across dependent equations—healing lost packets locally without waiting for a NACK Round-Trip Time (RTT).
+### 1. Inline Staggered & Adaptive $\phi$-Parity Coprime-Stride Interleaving
+Conventional Forward Error Correction (FEC) schemes group contiguous packets into block parity equations and emit parity bursts at block boundaries, which fail when network links experience Gilbert-Elliott contiguous burst losses.
+* **Coprime Stride Interleaving:** OpenFIR weaves GF(2) algebraic parity equations (`PKT_PHI_PARITY`) across non-adjacent chunks separated by a coprime stride $S = 5$ within a sliding window $W = 20$. Any contiguous burst loss of up to 5 packets impacts at most **one** symbol per algebraic equation.
+* **Inline Staggered Parity Injection:** Rather than emitting all 5 parity frames in a back-to-back micro-burst at the end of a 20-chunk window, parity bucket $b \in [0..4]$ is injected inline immediately after its final member chunk ($15 + b$) is sent—smoothing wire pacing and accelerating receiver peeling-decoder recovery.
+* **Adaptive Cruise / Armor Scaling:** On lossless links, OpenFIR operates in **Cruise Mode** (1 parity frame per window = 5% minimal probe overhead). The instant the receiver reports a NACK or an active peeling-decoder heal event, the sender automatically shifts into **Full Armor Mode** (5 coprime-stride parity frames per window = 25% protection) and smoothly scales back once the link stabilizes.
 
 ### 2. Intra-Session & Cross-Session Content-Addressed Zero-Byte Teleportation (`PKT_TELEPORT` & `PKT_CAS_TELEPORT`)
 Real-world datasets—such as virtual machine images, container layers, source trees, database snapshots, and incremental backups—contain substantial block redundancy both within a single transfer and across separate transfers over time.
@@ -54,7 +55,7 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 |                                   /                |                \             |
 |                        (New Hash)/      (CAS Bloom)|     (Seen Hash) \            |
 |                                 v                  v                  v           |
-|  [Phi-Stride Interleaver] <-- [PKT_DATA]   [PKT_CAS_TELEPORT]   [PKT_TELEPORT]    |
+|  [Inline Adaptive Phi-Parity] <-[PKT_DATA] [PKT_CAS_TELEPORT]   [PKT_TELEPORT]    |
 |             |                      \               |                 /            |
 |             v                       v              v                v             |
 |     [PKT_PHI_PARITY] -------------> [Micro-Burst Token-Bucket Pacer]              |
@@ -107,7 +108,7 @@ Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame 
 | `0x03` | `PKT_DATA` | `[4B ChunkIdx][8B SendTimestampNano][2B DataLen][Payload]` | Standard data payload frame |
 | `0x04` | `PKT_TELEPORT` | `[4B TargetIdx][4B SourceIdx][8B SendTimestampNano]` | Intra-session zero-byte content-addressed local clone instruction |
 | `0x05` | `PKT_PHI_PARITY` | `[1B MemberCount][N*4B MemberIndices][2B ParityLen][XORPayload]` | Coprime-stride interleaved GF(2) erasure recovery frame |
-| `0x06` | `PKT_FEEDBACK` | `[4B HighestContig][4B ScanLimit][4B RecvCnt][8B GradUs][8B QueueUs][2B NackCnt][N*4B Nacks]` | Selective repeat SACK/NACK bitmap + Kalman OWDG telemetry |
+| `0x06` | `PKT_FEEDBACK` | `[4B HighestContig][4B ScanLimit][4B RecvCnt][8B GradUs][8B QueueUs][2B Flags+NackCnt][N*4B Nacks]` | Selective repeat SACK/NACK bitmap + peeling heal signal + Kalman OWDG |
 | `0x07` | `PKT_FIN` | *(empty)* | Sender completion notification |
 | `0x08` | `PKT_FIN_ACK` | `[1B VerifiedStatus]` | End-to-end SHA-256 verification confirmation |
 | `0x09` | `PKT_ERROR` | `[1B ErrorCode][2B MsgLen][ErrorMessage]` | Explicit fatal error abort notification |
