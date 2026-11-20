@@ -424,7 +424,6 @@ func NewGlobalCASStore(rootDir string) *GlobalCASStore {
 	store := &GlobalCASStore{
 		entries: make(map[[32]byte]casChunkLocation),
 	}
-	// Pre-index existing completed files in outputDir on startup
 	_ = filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -1017,9 +1016,6 @@ func tuneUDPConn(conn *net.UDPConn) {
 	_ = conn.SetWriteBuffer(SocketBufferBytes)
 }
 
-// bindClientUDPSocket preferentially allocates client UDP sockets in the low
-// non-privileged port band [10000..32000] so SrcPort <= DstPort holds against
-// high server ports, falling back to OS ephemeral (:0) if constrained.
 func bindClientUDPSocket() (*net.UDPConn, error) {
 	for attempt := 0; attempt < 12; attempt++ {
 		port := 10000 + int(cryptoRandUint32()%22000)
@@ -1116,6 +1112,7 @@ type ReceiverSession struct {
 	statsTeleportChunks    uint64
 	statsCASTeleportChunks uint64
 	statsParityHealed      uint64
+	lastReportedHealed     uint64
 	statsDuplicatePkts     uint64
 	startTime              time.Time
 }
@@ -1776,7 +1773,6 @@ func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr)
 
 	casCount, casBloom := s.casStore.SnapshotBloom()
 
-	// Layout: [Magic 2B][Type 1B][8B TxID][4B HighestContig][4B CASEntryCount][1024B CASBloomFilter]
 	ack := make([]byte, 19+CASBloomBytes)
 	ack[0] = ProtocolMagic0
 	ack[1] = ProtocolMagic1
@@ -1851,7 +1847,6 @@ func (s *OpenFIRServer) handleTeleport(sess *ReceiverSession, p []byte, recvNano
 }
 
 func (s *OpenFIRServer) handleCASTeleport(sess *ReceiverSession, p []byte, recvNano int64) {
-	// Layout: [4B TargetIdx][32B FullSHA256][8B SendNano]
 	if len(p) < 44 {
 		return
 	}
@@ -1883,7 +1878,6 @@ func (s *OpenFIRServer) handleCASTeleport(sess *ReceiverSession, p []byte, recvN
 		return
 	}
 
-	// On Bloom filter false positive or stale CAS entry, queue urgent NACK for immediate raw fallback
 	sess.mu.Lock()
 	if !sess.completed && sess.receivedBitmap != nil && !sess.receivedBitmap.Get(targetIdx) {
 		if len(sess.urgentNacks) < MaxNackPerPacket {
@@ -2108,6 +2102,8 @@ func (s *OpenFIRServer) sendFeedback(sess *ReceiverSession, peer *net.UDPAddr) {
 	hc := sess.highestContig
 	rc := sess.receivedCount
 	total := sess.totalChunks
+	healedSignal := sess.statsParityHealed > sess.lastReportedHealed
+	sess.lastReportedHealed = sess.statsParityHealed
 
 	var nacks []uint32
 	if len(sess.urgentNacks) > 0 {
@@ -2134,6 +2130,12 @@ func (s *OpenFIRServer) sendFeedback(sess *ReceiverSession, peer *net.UDPAddr) {
 
 	gradUs, queueUs := sess.kalman.Snapshot()
 
+	nackHeaderField := uint16(len(nacks))
+	if healedSignal {
+		// Bit 15 signals to sender that receiver peeling decoder actively healed erasures
+		nackHeaderField |= 0x8000
+	}
+
 	pkt := make([]byte, 41+len(nacks)*4)
 	pkt[0] = ProtocolMagic0
 	pkt[1] = ProtocolMagic1
@@ -2144,7 +2146,7 @@ func (s *OpenFIRServer) sendFeedback(sess *ReceiverSession, peer *net.UDPAddr) {
 	binary.BigEndian.PutUint32(pkt[19:23], rc)
 	binary.BigEndian.PutUint64(pkt[23:31], uint64(gradUs))
 	binary.BigEndian.PutUint64(pkt[31:39], uint64(queueUs))
-	binary.BigEndian.PutUint16(pkt[39:41], uint16(len(nacks)))
+	binary.BigEndian.PutUint16(pkt[39:41], nackHeaderField)
 
 	offset := 41
 	for _, nackIdx := range nacks {
@@ -2271,7 +2273,7 @@ func (s *OpenFIRServer) broadcastFinAck(sess *ReceiverSession, tid uint64, verif
 }
 
 // ============================================================================
-// Module 7: OpenFIR Multi-Path Sender Engine (with Self-Healing Port Rotation)
+// Module 7: OpenFIR Multi-Path Sender Engine (Inline Staggered Adaptive Parity)
 // ============================================================================
 
 type ClientConfig struct {
@@ -2366,7 +2368,6 @@ func (c *OpenFIRClient) sendCloaked(raw []byte, onRotate func(*net.UDPConn)) {
 
 	_, _ = conn.WriteToUDP(wire, c.serverAddr)
 
-	// Self-healing ephemeral 5-tuple rotation when socket reaches byte quota
 	if newBytes >= SocketRotateByteQuota && onRotate != nil {
 		if atomic.CompareAndSwapUint64(&c.socketBytes[connIdx], newBytes, 0) {
 			if freshConn, err := bindClientUDPSocket(); err == nil {
@@ -2497,6 +2498,15 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 	lastServerContact := time.Now()
 	lastProgressTime := time.Now()
 
+	// Adaptive Loss-Driven Parity Armor state: starts armed during initial burst,
+	// scales down to 1 parity frame per window (5% cruise overhead) on clean links,
+	// and instantly re-arms full 5-bucket parity (25% armor) upon any loss or peeling heal.
+	var lossArmorUntilNano atomic.Int64
+	lossArmorUntilNano.Store(time.Now().Add(400 * time.Millisecond).UnixNano())
+	if c.chaos != nil && c.chaos.enabled {
+		lossArmorUntilNano.Store(time.Now().Add(1 * time.Hour).UnixNano())
+	}
+
 	stopRecv := make(chan struct{})
 	var recvWG sync.WaitGroup
 
@@ -2579,9 +2589,15 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					rc := binary.BigEndian.Uint32(p[8:12])
 					gradUs := int64(binary.BigEndian.Uint64(p[12:20]))
 					queueUs := int64(binary.BigEndian.Uint64(p[20:28]))
-					nackCount := int(binary.BigEndian.Uint16(p[28:30]))
+					rawNackField := binary.BigEndian.Uint16(p[28:30])
+					remoteHealedActive := (rawNackField & 0x8000) != 0
+					nackCount := int(rawNackField & 0x7FFF)
 
 					c.pacer.UpdateFromKalman(gradUs, queueUs)
+
+					if nackCount > 0 || remoteHealedActive {
+						lossArmorUntilNano.Store(time.Now().Add(1500 * time.Millisecond).UnixNano())
+					}
 
 					stateMu.Lock()
 					now := time.Now()
@@ -2752,7 +2768,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 	finBackoff := 15 * time.Millisecond
 	readBuf := make([]byte, chunkSize)
 
-	// Phase 2: Main transmission & selective repeat loop with strict watchdog deadlines
+	// Phase 2: Main transmission & selective repeat loop
 	for {
 		stateMu.Lock()
 		fErr := remoteFatalErr
@@ -2808,7 +2824,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 			continue
 		}
 
-		// Priority 2: First-pass transmission (Intra-Session Teleport -> Cross-Session CAS Teleport -> Raw Data)
+		// Priority 2: First-pass transmission with Inline Staggered Adaptive Phi-Parity Injection
 		if nextChunk < totalChunks {
 			idx := nextChunk
 			nextChunk++
@@ -2852,19 +2868,29 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 
 			padded := make([]byte, chunkSize)
 			copy(padded, chunkData)
-			windowChunks[windowFill] = padded
-			windowIndices[windowFill] = idx
+			pos := windowFill
+			windowChunks[pos] = padded
+			windowIndices[pos] = idx
 			windowFill++
 
-			if windowFill == PhiWindowSize {
-				for bucket := 0; bucket < PhiStride; bucket++ {
+			// Inline Staggered Parity Injection:
+			// Bucket b (0..4) completes as soon as member position (15 + b) is filled.
+			// Emitting Parity[b] inline right after chunk (15 + b) eliminates the
+			// 5-packet end-of-window micro-burst and accelerates receiver peeling recovery!
+			if pos >= PhiWindowSize-PhiStride {
+				bucket := pos - (PhiWindowSize - PhiStride)
+				activeBuckets := 1 // Cruise mode: 5% minimal parity probe overhead on lossless links
+				if time.Now().UnixNano() < lossArmorUntilNano.Load() {
+					activeBuckets = PhiStride // Armor mode: full 5-bucket (25%) coprime-stride protection
+				}
+				if bucket < activeBuckets {
 					members := make([]uint32, PhiGroupMembers)
 					xorPayload := make([]byte, chunkSize)
 					for m := 0; m < PhiGroupMembers; m++ {
-						pos := bucket + m*PhiStride
-						members[m] = windowIndices[pos]
+						mPos := bucket + m*PhiStride
+						members[m] = windowIndices[mPos]
 						for b := 0; b < chunkSize; b++ {
-							xorPayload[b] ^= windowChunks[pos][b]
+							xorPayload[b] ^= windowChunks[mPos][b]
 						}
 					}
 					parityPkt := buildPhiParityPacket(transferID, members, xorPayload)
@@ -2872,6 +2898,9 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					c.sendCloaked(parityPkt, spawnSocketReader)
 					phiParitySentCount++
 				}
+			}
+
+			if windowFill == PhiWindowSize {
 				windowFill = 0
 			}
 			continue
@@ -3063,7 +3092,7 @@ func sendOversizedUDPProbes(targetAddr string) error {
 
 func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	fmt.Printf("====================================================================\n")
-	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.4.0)\n")
+	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.5.0)\n")
 	fmt.Printf("  Injected Channel Conditions: LossRate=%.1f%% | MeanBurstLength=%d | Sockets=%d\n",
 		lossRate*100, burstLen, numSockets)
 	fmt.Printf("====================================================================\n")
@@ -3348,11 +3377,9 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	// ------------------------------------------------------------------------
 	fmt.Printf("\n--- [Suite 4/4] Cross-Session Persistent CAS Instant Teleportation ---\n")
 	v2File := filepath.Join(tmpDir, "incremental_v2.bin")
-	// Construct an 8 MB v2 file that shares 85% of chunks with already-received concurrent_A.bin & test_payload.bin
 	v2Bytes := make([]byte, 8*1024*1024)
 	copy(v2Bytes[0:4*1024*1024], bytesA)
 	copy(v2Bytes[4*1024*1024:8*1024*1024], rawFileBytes[0:4*1024*1024])
-	// Mutate 15% of the blocks with fresh random content
 	_, _ = rand.Read(v2Bytes[1024*1024 : 2*1024*1024])
 	if err := os.WriteFile(v2File, v2Bytes, 0644); err != nil {
 		return err
@@ -3428,7 +3455,7 @@ func main() {
 	flag.Parse()
 
 	if *mode == "" {
-		fmt.Fprintf(os.Stderr, "OpenFIR v0.4.0 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
+		fmt.Fprintf(os.Stderr, "OpenFIR v0.5.0 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  Run self-test : openfir -mode selftest\n")
 		fmt.Fprintf(os.Stderr, "  Start server  : openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret <64-hex-chars>\n")
@@ -3470,7 +3497,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Error] Failed to initialize server: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("[Server] OpenFIR v0.4.0 listening on %s (output dir: %s, overwrite: %v)\n",
+		fmt.Printf("[Server] OpenFIR v0.5.0 listening on %s (output dir: %s, overwrite: %v)\n",
 			srv.LocalAddr(), *outDir, *overwrite)
 		if err := srv.Serve(0); err != nil {
 			fmt.Fprintf(os.Stderr, "[Error] Server runtime error: %v\n", err)
