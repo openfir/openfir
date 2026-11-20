@@ -3,7 +3,7 @@
 
 **OpenFIR** (**Open** **F**ast **I**nterleaved **R**eliable Transport Protocol) is a high-performance, multi-path, delay-gradient controlled, algebraically self-healing UDP file and directory transfer engine written in pure Go with zero external dependencies.
 
-Engineered for high Bandwidth-Delay Product (BDP) wide-area networks, transcontinental links, satellite backhauls, and lossy wireless channels, OpenFIR decouples congestion control from random packet loss while eliminating retransmission round-trip penalties through inline coprime-stride erasure interleaving, intra-session and cross-session content-addressed zero-byte teleportation, zero-RTT virtual continuous directory extents, and self-healing multi-socket 5-tuple striping.
+Engineered for high Bandwidth-Delay Product (BDP) wide-area networks, transcontinental links, satellite backhauls, and lossy wireless channels, OpenFIR decouples congestion control from random packet loss while eliminating retransmission round-trip penalties through inline coprime-stride erasure interleaving, intra-session and cross-session content-addressed zero-byte teleportation, zero-RTT virtual continuous directory extents, and self-healing $M \times N$ multi-socket 5-tuple striping.
 
 ---
 
@@ -35,10 +35,10 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 * **Clock-Offset Cancellation:** Constant clock offsets between sender and receiver cancel out algebraically without requiring NTP synchronization.
 * **1D Kalman Noise Filtering:** A scalar Kalman filter separates OS scheduling jitter from true bottleneck queue buildup, driving a microsecond-resolution token-bucket pacer that keeps bottleneck router queues shallow while fully saturating available link capacity.
 
-### 5. Polymorphic Printable-ASCII Wire Security, Low-Port Striping & Self-Healing Socket Rotation
+### 5. $M \times N$ Multi-Port Matrix, 600ms Dead-Path Watchdog & Polymorphic ASCII Wire Security
+* **$M \times N$ Multi-Port Matrix & Strict 4-Tuple Symmetry (`-port-span` & `-sockets`):** The server binds a contiguous matrix of $M$ UDP ports (`-port-span 4` by default) with parallel kernel reader loops and advertises them in `PKT_HANDSHAKE_ACK`. All server responses are pinned strictly to the exact server socket that received each client path, ensuring 100% symmetric 4-tuple NAT traversal.
+* **600ms Dead-Path Watchdog & 12 MB Byte-Quota Morphing:** Client UDP sockets bind in the low non-privileged band (`10000..32000`) and automatically hot-swap to fresh local ports and alternate server matrix ports either upon reaching a 12 MB byte quota or within **600ms** of return-path feedback silence.
 * **Per-Packet Polymorphic Printable-ASCII Header (`0x21..0x7E`):** Every datagram begins with 6 per-packet polymorphic printable ASCII characters (`wire[0:6]`), where `wire[5]` embeds an `HKDF-SHA256` keyed authentication tag and directional parity bit ($47 \times 2 = 94$), followed by a key-masked sequence number (`wire[6:14]`) and a 32-bit CSPRNG salt (`wire[14:18]`). The entire 18-byte outer header is bound as `AES-256-GCM` Additional Authenticated Data (`AAD`) and protected by an 8,192-packet sliding anti-replay window.
-* **Low-Ephemeral Source Port Allocation (`10000..32000`) & Self-Healing Rotation:** Client UDP sockets preferentially bind random available ports in the low non-privileged band (`10000..32000`) and automatically hot-swap to fresh local sockets upon reaching a 12 MB per-5-tuple byte quota, preventing individual flows from tripping carrier long-flow volume policers.
-* **Stateless HMAC Cookie Challenge (`PKT_COOKIE_CHALLENGE`) & Atomic Staging:** Prevents spoofed-IP UDP reflection by requiring clients to echo a stateless HMAC-SHA256 cookie before any session or staging file is allocated. All transfers stream into isolated `.openfir-part-<txid>` staging files and atomically `os.Rename` into place only after out-of-lock `fsync` and full `SHA-256` verification succeed.
 
 ---
 
@@ -64,15 +64,15 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 |                   [Polymorphic ASCII AAD + MaskedSeq + AES-256-GCM Sealer]        |
 |                                                |                                  |
 |                                                v                                  |
-|                   [Self-Healing Low-Port UDP Striping Pool (1..N, 12MB Quota)]    |
+|             [Self-Healing Low-Port Striping Pool (1..N, 600ms Watchdog / 12MB)]   |
 +------------------------------------------------|------------+---------------------+
                                                  |            |
-                            Multi-5-Tuple UDP    |            | PKT_FEEDBACK
-                          (High-BDP / Lossy WAN) v            | (SACK + NACK + OWDG)
+                               M x N 5-Tuple UDP |            | Symmetric 4-Tuple
+                              (High-BDP / Lossy) v            | PKT_FEEDBACK
 +------------------------------------------------|------------+---------------------+
 |                                 OpenFIR RECEIVER            |                     |
 |                                                             |                     |
-|                     [Multi-Core AES-256-GCM + Anti-Replay Worker Pool]            |
+|               [Multi-Port Server Matrix (1..M) + Multi-Core AES-GCM Pool]         |
 |                           /              |              \            \            |
 |            (PKT_PHI_PARITY)          (PKT_DATA)   (PKT_TELEPORT) (PKT_CAS_TELEPORT)
 |                   \                      |              /            /            |
@@ -104,7 +104,7 @@ Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame 
 | `FrameType` | Name | Inner Payload Layout (after `3B Hdr + 8B TxID`) | Description |
 | :--- | :--- | :--- | :--- |
 | `0x01` | `PKT_HANDSHAKE` | `[16B Cookie][8B Size][4B ChunkSz][4B Chunks][32B SHA256][1B Flags][2B NameLen][Name]` | Session initialization (`Flags=0x01` indicates directory bundle) |
-| `0x02` | `PKT_HANDSHAKE_ACK` | `[4B HighestContig][4B CASEntryCount][1024B CASBloomFilter]` | Session readiness confirmation, resume offset & 8192-bit CAS summary |
+| `0x02` | `PKT_HANDSHAKE_ACK` | `[4B HighestContig][4B CASCnt][1024B CASBloom][1B PortCnt][M*2B MatrixPorts]` | Session confirmation, resume offset, CAS Bloom & Server Port Matrix |
 | `0x03` | `PKT_DATA` | `[4B ChunkIdx][8B SendTimestampNano][2B DataLen][Payload]` | Standard data payload frame |
 | `0x04` | `PKT_TELEPORT` | `[4B TargetIdx][4B SourceIdx][8B SendTimestampNano]` | Intra-session zero-byte content-addressed local clone instruction |
 | `0x05` | `PKT_PHI_PARITY` | `[1B MemberCount][N*4B MemberIndices][2B ParityLen][XORPayload]` | Coprime-stride interleaved GF(2) erasure recovery frame |
@@ -124,7 +124,7 @@ Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame 
 
 ### 1. Run Built-In Chaos Self-Test (`selftest` mode)
 OpenFIR includes an integrated Gilbert-Elliott burst-loss chaos simulator that automatically validates **four** test suites under 8% burst packet loss (plus oversized datagram resilience):
-1. Three consecutive 16 MB mixed-entropy large file transfers;
+1. Three consecutive 16 MB mixed-entropy large file transfers across a 4x8 multi-port matrix;
 2. A 200-file nested directory tree (including empty subdirectories) via Zero-RTT Virtual Extent;
 3. Concurrent multi-client transfers to a single server;
 4. Cross-session persistent CAS instant teleportation across incremental datasets.
@@ -147,7 +147,7 @@ export OPENFIR_SECRET=$(openssl rand -hex 32)
 
 #### Start Receiver (`server` mode)
 ```bash
-./openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret "$OPENFIR_SECRET"
+./openfir -mode server -listen 0.0.0.0:9900 -port-span 4 -out ./downloads -secret "$OPENFIR_SECRET"
 ```
 
 #### Send a Single Large File OR an Entire Directory of Small Files (`client` mode)
@@ -174,7 +174,8 @@ export OPENFIR_SECRET=$(openssl rand -hex 32)
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `-mode` | `""` | Execution mode: `server`, `client`, or `selftest` |
-| `-listen` | `0.0.0.0:9900` | UDP listen address for `server` mode |
+| `-listen` | `0.0.0.0:9900` | Primary UDP listen address for `server` mode |
+| `-port-span` | `4` | Number of contiguous UDP ports in server listener matrix |
 | `-out` | `./openfir_downloads` | Output directory for received files/directories in `server` mode |
 | `-server` | `127.0.0.1:9900` | Target server UDP address for `client` mode |
 | `-file` | `""` | Path to the file OR directory to transmit in `client` mode |
