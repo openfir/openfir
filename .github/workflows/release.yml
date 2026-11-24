@@ -203,12 +203,12 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-          mkdir -p release-assets dist/apple/Payload
-          (cd dist/apple/DerivedMac/Build/Products/Release && zip -qr "../../../../../release-assets/openfir-gui_${VERSION}_macos_universal.zip" OpenFIR.app)
+          mkdir -p "${GITHUB_WORKSPACE}/release-assets" dist/apple/Payload
+          (cd dist/apple/DerivedMac/Build/Products/Release && zip -qr "${GITHUB_WORKSPACE}/release-assets/openfir-gui_${VERSION}_macos_universal.zip" OpenFIR.app)
           cp -R dist/apple/DerivedIOS/Build/Products/Release-iphoneos/OpenFIR.app dist/apple/Payload/
-          (cd dist/apple && zip -qr "../../release-assets/openfir-gui_${VERSION}_ios_arm64_unsigned.ipa" Payload)
-          (cd dist/apple && zip -qr "../../release-assets/OpenFIRCore_${VERSION}.xcframework.zip" OpenFIRCore.xcframework)
-          ls -lh release-assets/
+          (cd dist/apple && zip -qr "${GITHUB_WORKSPACE}/release-assets/openfir-gui_${VERSION}_ios_arm64_unsigned.ipa" Payload)
+          (cd dist/apple && zip -qr "${GITHUB_WORKSPACE}/release-assets/OpenFIRCore_${VERSION}.xcframework.zip" OpenFIRCore.xcframework)
+          ls -lh "${GITHUB_WORKSPACE}/release-assets/"
       - uses: actions/upload-artifact@v4
         with:
           name: release-apple-guis
