@@ -70,6 +70,8 @@ type SenderConfig struct {
 	MaxMBps       float64
 	MaxParity     int
 	Chaos         *UDPChaos
+	Op            string
+	OnProgress    func(ProgressSnapshot)
 }
 
 type inflightBlock struct {
@@ -238,6 +240,13 @@ func RunSender(ctx context.Context, cfg SenderConfig) (*TransferStats, error) {
 	var udpBlocksSent atomic.Uint32
 	var tcpBlocksSent atomic.Uint32
 	var udpFallbackBlocks atomic.Uint32
+	var bytesDone atomic.Int64
+	var totalBlocksAtomic atomic.Uint32
+	var casBlocksAtomic atomic.Uint32
+	var resumedBlocksAtomic atomic.Uint32
+	var zeroBlocksAtomic atomic.Uint32
+	var compBlocksAtomic atomic.Uint32
+	var rawBlocksAtomic atomic.Uint32
 
 	// Multi-Stream TLS 1.3 TCP worker pool
 	type tcpJob struct {
@@ -601,6 +610,85 @@ func RunSender(ctx context.Context, cfg SenderConfig) (*TransferStats, error) {
 		}
 	}()
 
+	if cfg.OnProgress != nil {
+		opName := cfg.Op
+		if opName == "" {
+			opName = "push"
+		}
+		fbWG.Add(1)
+		go func() {
+			defer fbWG.Done()
+			tk := time.NewTicker(50 * time.Millisecond)
+			defer tk.Stop()
+			var prevBytes int64
+			prevTime := start
+			for {
+				select {
+				case <-sCtx.Done():
+					return
+				case now := <-tk.C:
+					done := bytesDone.Load()
+					if done > cfg.TotalSize {
+						done = cfg.TotalSize
+					}
+					elapsed := now.Sub(start).Seconds()
+					if elapsed <= 0 {
+						elapsed = 0.001
+					}
+					dt := now.Sub(prevTime).Seconds()
+					var instMBps float64
+					if dt > 0 {
+						instMBps = (float64(done-prevBytes) / (1024 * 1024)) / dt
+					}
+					prevBytes = done
+					prevTime = now
+
+					pct := 0.0
+					if cfg.TotalSize > 0 {
+						pct = float64(done) / float64(cfg.TotalSize) * 100.0
+						if pct > 99.5 {
+							pct = 99.5
+						}
+					}
+					lane := "TLS1.3-TCP"
+					if useUDP && useTCP {
+						if udpDegraded.Load() {
+							lane = "FAILOVER-TCP"
+						} else {
+							lane = "HYBRID"
+						}
+					} else if useUDP {
+						lane = "UDP-GSO"
+					}
+					cfg.OnProgress(ProgressSnapshot{
+						Op:                opName,
+						Phase:             "transferring",
+						BytesDone:         done,
+						TotalBytes:        cfg.TotalSize,
+						Percent:           pct,
+						GoodputMBps:       (float64(done) / (1024 * 1024)) / elapsed,
+						InstantMBps:       instMBps,
+						PacingMBps:        ctrlCC.CurrentMBps(),
+						RTTMs:             float64(ctrlCC.SRTT().Microseconds()) / 1000.0,
+						ActiveLane:        lane,
+						WireUDPBytes:      wireUDPBytes.Load(),
+						WireTCPBytes:      wireTCPBytes.Load(),
+						TotalBlocks:       totalBlocksAtomic.Load(),
+						CASBlocks:         casBlocksAtomic.Load(),
+						ResumedBlocks:     resumedBlocksAtomic.Load(),
+						ZeroBlocks:        zeroBlocksAtomic.Load(),
+						CompressedBlocks:  compBlocksAtomic.Load(),
+						RawBlocks:         rawBlocksAtomic.Load(),
+						FECParitySent:     fecParitySent.Load(),
+						FECRecovered:      fecRecovered.Load(),
+						UDPFallbackBlocks: udpFallbackBlocks.Load(),
+						ElapsedMs:         now.Sub(start).Milliseconds(),
+					})
+				}
+			}
+		}()
+	}
+
 	var cleanupOnce sync.Once
 	cleanupWorkers := func() {
 		cleanupOnce.Do(func() {
@@ -722,12 +810,17 @@ func RunSender(ctx context.Context, cfg SenderConfig) (*TransferStats, error) {
 		}
 
 		for i, m := range metas {
+			totalBlocksAtomic.Add(1)
 			switch states[i] {
 			case 1: // Exact Cross-Session Rabin CDC CAS Hit -> 0 wire payload bytes
 				stats.CASBlocks++
+				casBlocksAtomic.Add(1)
+				bytesDone.Add(int64(m.Length))
 				continue
 			case 2: // Persistent .openfir-state Crash-Resume Hit -> 0 wire payload bytes
 				stats.ResumedBlocks++
+				resumedBlocksAtomic.Add(1)
+				bytesDone.Add(int64(m.Length))
 				continue
 			}
 
@@ -735,6 +828,7 @@ func RunSender(ctx context.Context, cfg SenderConfig) (*TransferStats, error) {
 			switch enc {
 			case compress.EncodingZero:
 				stats.ZeroBlocks++
+				zeroBlocksAtomic.Add(1)
 				var b [4]byte
 				binary.BigEndian.PutUint32(b[:], m.Index)
 				stateMu.Lock()
@@ -747,8 +841,10 @@ func RunSender(ctx context.Context, cfg SenderConfig) (*TransferStats, error) {
 				continue
 			case compress.EncodingDeflate:
 				stats.CompressedBlocks++
+				compBlocksAtomic.Add(1)
 			default:
 				stats.RawBlocks++
+				rawBlocksAtomic.Add(1)
 			}
 
 			totalSlices := uint16((len(wirePayload) + UDPSlicePayloadBytes - 1) / UDPSlicePayloadBytes)
@@ -859,6 +955,13 @@ func RunSender(ctx context.Context, cfg SenderConfig) (*TransferStats, error) {
 	stats.FECRecovered = fecRecovered.Load()
 	stats.Elapsed = time.Since(start)
 	stats.MerkleRoot = root
+	if cfg.OnProgress != nil {
+		opName := cfg.Op
+		if opName == "" {
+			opName = "push"
+		}
+		cfg.OnProgress(snapshotFromFinalStats(opName, stats))
+	}
 	return stats, nil
 }
 
@@ -876,6 +979,8 @@ type ReceiverConfig struct {
 	Ctrl           *CtrlChannel
 	TCPConns       []io.ReadWriteCloser
 	UDPRxCh        <-chan UDPInbound // Already decrypted & replay-checked by Server/Client UDP demux!
+	Op             string
+	OnProgress     func(ProgressSnapshot)
 }
 
 type UDPInbound struct {
@@ -934,6 +1039,8 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 	var zeroCount atomic.Uint32
 	var compCount atomic.Uint32
 	var rawCount atomic.Uint32
+	var bytesDone atomic.Int64
+	var totalBlocksSeen atomic.Uint32
 
 	commitBlock := func(bIdx uint32, encoding uint8, wirePayload []byte, fromUDP bool) {
 		mu.Lock()
@@ -967,9 +1074,11 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 		}
 
 		needCheckpoint := false
+		committedNow := false
 		mu.Lock()
 		if !doneBlocks[bIdx] {
 			doneBlocks[bIdx] = true
+			committedNow = true
 			delete(udpPartials, bIdx)
 			committedSinceCheckpoint++
 			if committedSinceCheckpoint >= 32 {
@@ -981,6 +1090,9 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 			}
 		}
 		mu.Unlock()
+		if committedNow {
+			bytesDone.Add(int64(meta.Length))
+		}
 
 		if needCheckpoint {
 			_ = staging.SaveCheckpoint()
@@ -1193,6 +1305,77 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 		}()
 	}
 
+	if cfg.OnProgress != nil {
+		opName := cfg.Op
+		if opName == "" {
+			opName = "pull"
+		}
+		dataWG.Add(1)
+		go func() {
+			defer dataWG.Done()
+			tk := time.NewTicker(50 * time.Millisecond)
+			defer tk.Stop()
+			var prevBytes int64
+			prevTime := start
+			for {
+				select {
+				case <-rCtx.Done():
+					return
+				case now := <-tk.C:
+					done := bytesDone.Load()
+					if done > cfg.TotalSize {
+						done = cfg.TotalSize
+					}
+					elapsed := now.Sub(start).Seconds()
+					if elapsed <= 0 {
+						elapsed = 0.001
+					}
+					dt := now.Sub(prevTime).Seconds()
+					var instMBps float64
+					if dt > 0 {
+						instMBps = (float64(done-prevBytes) / (1024 * 1024)) / dt
+					}
+					prevBytes = done
+					prevTime = now
+
+					pct := 0.0
+					if cfg.TotalSize > 0 {
+						pct = float64(done) / float64(cfg.TotalSize) * 100.0
+						if pct > 99.5 {
+							pct = 99.5
+						}
+					}
+					lane := "TLS1.3-TCP"
+					if wireUDPBytes.Load() > 0 && wireTCPBytes.Load() > 0 {
+						lane = "HYBRID"
+					} else if wireUDPBytes.Load() > 0 {
+						lane = "UDP-GSO"
+					}
+					cfg.OnProgress(ProgressSnapshot{
+						Op:               opName,
+						Phase:            "transferring",
+						BytesDone:        done,
+						TotalBytes:       cfg.TotalSize,
+						Percent:          pct,
+						GoodputMBps:      (float64(done) / (1024 * 1024)) / elapsed,
+						InstantMBps:      instMBps,
+						ActiveLane:       lane,
+						WireUDPBytes:     wireUDPBytes.Load(),
+						WireTCPBytes:     wireTCPBytes.Load(),
+						TotalBlocks:      totalBlocksSeen.Load(),
+						CASBlocks:        casCount.Load(),
+						ResumedBlocks:    resumedCount.Load(),
+						ZeroBlocks:       zeroCount.Load(),
+						CompressedBlocks: compCount.Load(),
+						RawBlocks:        rawCount.Load(),
+						FECRecovered:     fecRecCount.Load(),
+						ElapsedMs:        now.Sub(start).Milliseconds(),
+					})
+				}
+			}
+		}()
+	}
+
 	// 4. Main TLS 1.3 Control Loop (Handles Exact CAS Query, Zero Blocks, Fin + Merkle Verification)
 	var cleanupRxOnce sync.Once
 	cleanupReceiver := func() {
@@ -1220,6 +1403,7 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 			}
 			states := make([]byte, len(qMetas))
 			for i, m := range qMetas {
+				totalBlocksSeen.Add(1)
 				mu.Lock()
 				metas[m.Index] = m
 				mu.Unlock()
@@ -1231,6 +1415,7 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 					doneBlocks[m.Index] = true
 					mu.Unlock()
 					resumedCount.Add(1)
+					bytesDone.Add(int64(m.Length))
 					states[i] = 2
 					continue
 				}
@@ -1244,6 +1429,7 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 							doneBlocks[m.Index] = true
 							mu.Unlock()
 							casCount.Add(1)
+							bytesDone.Add(int64(m.Length))
 							states[i] = 1
 							continue
 						}
@@ -1318,6 +1504,13 @@ func RunReceiver(ctx context.Context, cfg ReceiverConfig) (*TransferStats, error
 			stats.ExtractedItems = extracted
 			stats.Elapsed = time.Since(start)
 			stats.MerkleRoot = actualRoot
+			if cfg.OnProgress != nil {
+				opName := cfg.Op
+				if opName == "" {
+					opName = "pull"
+				}
+				cfg.OnProgress(snapshotFromFinalStats(opName, stats))
+			}
 			return stats, nil
 
 		case MsgAbort:

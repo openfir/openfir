@@ -1,13 +1,18 @@
 # Third-Party Open Source Licenses
 
-OpenFIR v1.0 has **zero third-party GitHub module dependencies**. Every protocol
-component (Rabin polynomial CDC, Streaming Merkle Tree, Systematic Cauchy GF(256)
-Reed-Solomon FEC, Delay-Gradient Congestion Control, Hybrid UDP/TLS-1.3 Engine,
-and Resumable Storage) is original clean-room code licensed under the Apache
-License, Version 2.0.
+OpenFIR v1.1 has **zero third-party GitHub module or UI library dependencies**.
+Every protocol component (Rabin polynomial CDC, Streaming Merkle Tree, Systematic
+Cauchy GF(256) Reed-Solomon FEC, Delay-Gradient Congestion Control, Hybrid
+UDP/TLS-1.3 Engine, and Resumable Storage) and every native user interface
+(Linux CLI C11 TrueColor TUI, Linux Desktop C++20 X11/Xft Gaussian-Blur GUI,
+Windows C++20 Win32/Direct2D/DWM Acrylic GUI, macOS Swift AppKit Vibrancy GUI,
+iOS 15+ SwiftUI Material GUI, and Android 8–15+ pure-SDK Kotlin/RenderEffect GUI)
+is 100% original clean-room code licensed under the Apache License, Version 2.0.
 
-Compiled binaries link only against the **Go Standard Library** and the official
-Go project extension modules **`golang.org/x/crypto`** and **`golang.org/x/sys`**,
+Compiled binaries link exclusively against operating-system platform SDKs
+(POSIX/`libc`, X11/Xft, Win32/Direct2D/DirectWrite/DWM, Apple OS Frameworks,
+Android Platform SDK/NDK), the **Go Standard Library**, and the official Go
+project extension modules **`golang.org/x/crypto`** and **`golang.org/x/sys`**,
 all of which are licensed under the **BSD 3-Clause License** plus the Go Project
 Additional IP Rights Grant (Patents) reproduced verbatim below.
 

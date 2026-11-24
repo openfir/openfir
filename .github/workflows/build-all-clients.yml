@@ -1,0 +1,208 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Build All-Platform Native Clients (OpenFIR)
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 (Core + C11 TUI + C++20 X11 GUI)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install System X11/Xft Headers & Clang
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang libx11-dev libxft-dev libfontconfig1-dev pkg-config
+      - name: Verify Core Tests (-race) & C ABI Header
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+          clang -x c -fsyntax-only -Wall -Wextra -Werror include/openfir.h
+      - name: Build CLI, libopenfir_core.so, C11 TUI & C++20 X11 GUI
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/openfir ./cmd/openfir
+          CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
+            -ldflags="-s -w -extldflags=-Wl,-soname,libopenfir_core.so" \
+            -o dist/libopenfir_core.so ./cmd/openfir-cabi
+          make -C apps/linux-tui test
+          make -C apps/linux-gui test
+          readelf -d dist/libopenfir_core.so | grep 'SONAME' | grep 'libopenfir_core.so'
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfir-linux-x86_64
+          path: |
+            dist/openfir
+            dist/openfir-tui
+            dist/openfir-gui
+            dist/libopenfir_core.so
+            include/openfir.h
+            dist/LICENSE
+            dist/NOTICE
+            dist/THIRD_PARTY_LICENSES.md
+
+  linux-arm64:
+    name: Linux ARM64 (Core + C11 TUI + C++20 X11 GUI)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install System X11/Xft Headers
+        run: sudo apt-get update && sudo apt-get install -y build-essential libx11-dev libxft-dev libfontconfig1-dev pkg-config
+      - name: Build & Smoke-Test ARM64 CLI, C11 TUI & C++20 X11 GUI
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/openfir ./cmd/openfir
+          CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
+            -ldflags="-s -w -extldflags=-Wl,-soname,libopenfir_core.so" \
+            -o dist/libopenfir_core.so ./cmd/openfir-cabi
+          make -C apps/linux-tui test
+          make -C apps/linux-gui test
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfir-linux-arm64
+          path: |
+            dist/openfir
+            dist/openfir-tui
+            dist/openfir-gui
+            dist/libopenfir_core.so
+            include/openfir.h
+            dist/LICENSE
+            dist/NOTICE
+            dist/THIRD_PARTY_LICENSES.md
+
+  windows-x86_64:
+    name: Windows x86_64 (C++20 Direct2D/Acrylic GUI + Core DLL)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build openfir_core.dll, openfir.exe & C++20 Direct2D OpenFIR.exe
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+          }
+          gcc --version
+          .\apps\windows\build_windows.ps1
+          Write-Host "Running Windows Direct2D OpenFIR.exe --smoke-test..."
+          & .\dist\windows\OpenFIR.exe --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist\windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfir-windows-x86_64
+          path: dist/windows
+
+  apple-macos-and-ios:
+    name: Apple macOS 13+ (.app) & iOS 15+ (.ipa) Native Frosted-Glass GUIs
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build Universal OpenFIRCore.xcframework (macOS + iOS 15+ arm64)
+        run: |
+          chmod +x scripts/build_apple_core.sh
+          ./scripts/build_apple_core.sh
+      - name: Generate Xcode Project & Build macOS Native App + iOS 15+ IPA
+        run: |
+          (cd apps/apple && xcodegen generate)
+          xcodebuild \
+            -project apps/apple/OpenFIRApple.xcodeproj \
+            -scheme OpenFIRMac \
+            -configuration Release \
+            -sdk macosx \
+            -derivedDataPath dist/apple/DerivedMac \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+          (cd dist/apple/DerivedMac/Build/Products/Release && zip -qr ../../../../OpenFIR-macOS.app.zip OpenFIR.app)
+          ls -lh dist/apple/OpenFIR-macOS.app.zip
+
+          xcodebuild \
+            -project apps/apple/OpenFIRApple.xcodeproj \
+            -scheme OpenFIRiOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath dist/apple/DerivedIOS \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+          mkdir -p dist/apple/Payload
+          cp -R dist/apple/DerivedIOS/Build/Products/Release-iphoneos/OpenFIR.app dist/apple/Payload/
+          (cd dist/apple && zip -qr OpenFIR-iOS-unsigned.ipa Payload)
+          ls -lh dist/apple/OpenFIR-iOS-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenFIRCore-xcframework
+          path: dist/apple/OpenFIRCore.xcframework
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfir-macos-app
+          path: dist/apple/OpenFIR-macOS.app.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfir-ios-ipa
+          path: dist/apple/OpenFIR-iOS-unsigned.ipa
+
+  android-apk:
+    name: Android 8–15+ Native Frosted-Glass APK (Zero AndroidX + NDK)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Build Android libopenfir_core.so (arm64-v8a + x86_64)
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT}}"
+          echo "Using ANDROID_NDK_HOME=${ANDROID_NDK_HOME}"
+          chmod +x scripts/build_android_core.sh
+          ./scripts/build_android_core.sh
+      - name: Build Zero-Third-Party-Dep Android APK & Verify SONAME
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT}}"
+          gradle --no-daemon -p apps/android assembleDebug
+          mkdir -p dist/android/apk
+          cp apps/android/app/build/outputs/apk/debug/app-debug.apk dist/android/apk/OpenFIR-Android.apk
+          ls -lh dist/android/apk/OpenFIR-Android.apk
+          unzip -l dist/android/apk/OpenFIR-Android.apk | grep '\.so$'
+          mkdir -p /tmp/openfir_apk_check && unzip -qo dist/android/apk/OpenFIR-Android.apk 'lib/arm64-v8a/*.so' -d /tmp/openfir_apk_check
+          readelf -d /tmp/openfir_apk_check/lib/arm64-v8a/libopenfir_core.so | grep 'SONAME' | grep 'libopenfir_core.so'
+          readelf -d /tmp/openfir_apk_check/lib/arm64-v8a/libopenfir_jni.so | grep 'NEEDED' | grep '\[libopenfir_core.so\]'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfir-android-apk
+          path: dist/android/apk/OpenFIR-Android.apk

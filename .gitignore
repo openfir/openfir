@@ -6,3 +6,9 @@ dist/
 *.openfir-state.tmp
 openfir_data/
 openfir_downloads/
+apps/android/.gradle/
+apps/android/app/build/
+apps/android/app/.cxx/
+apps/android/build/
+apps/apple/*.xcodeproj/
+apps/apple/DerivedData/

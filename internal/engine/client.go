@@ -32,9 +32,10 @@ type ClientConfig struct {
 	TCPStreams     int           // Number of parallel TLS 1.3 TCP data lanes (default 4 in auto/tcp mode)
 	InitMBps       float64       // Slow-start entry rate in MiB/s (default 4.0 MiB/s)
 	MaxMBps        float64       // Maximum pacing rate in MiB/s (default 1000.0 MiB/s)
-	MaxParity      int           // Max GF(256) RS parity shards per 16-shard group (default 8)
-	AllowOverwrite bool          // Used on Pull mode
-	UDPChaos       *UDPChaos     // Optional chaos injector for selftest / ISP QoS verification
+	MaxParity      int                    // Max GF(256) RS parity shards per 16-shard group (default 8)
+	AllowOverwrite bool                   // Used on Pull mode
+	UDPChaos       *UDPChaos              // Optional chaos injector for selftest / ISP QoS verification
+	OnProgress     func(ProgressSnapshot) // Optional real-time telemetry callback for native GUIs/TUIs
 }
 
 type Client struct {
@@ -351,6 +352,8 @@ func (c *Client) Push(ctx context.Context, localPath, remoteName string) (*Trans
 		MaxMBps:       c.cfg.MaxMBps,
 		MaxParity:     c.cfg.MaxParity,
 		Chaos:         c.cfg.UDPChaos,
+		Op:            "push",
+		OnProgress:    c.cfg.OnProgress,
 	})
 }
 
@@ -406,6 +409,8 @@ func (c *Client) Pull(ctx context.Context, remoteName, localOutDir string) (*Tra
 		Ctrl:           bundle.ctrl,
 		TCPConns:       bundle.tcpConns,
 		UDPRxCh:        udpCh,
+		Op:             "pull",
+		OnProgress:     c.cfg.OnProgress,
 	})
 }
 

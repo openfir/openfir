@@ -158,6 +158,35 @@ export OPENFIR_SECRET=$(./bin/openfir -mode keygen)
 
 ---
 
+## All-Platform Native Frosted-Glass Clients (*Obsidian Frost × Neon Aurora*)
+
+All six OpenFIR clients share a unified modern Web3 frosted-glass design language ([`design/DESIGN_SYSTEM.md`](design/DESIGN_SYSTEM.md)) and link directly in-process to the Apache-2.0 OpenFIR C ABI core ([`include/openfir.h`](include/openfir.h)) with **zero third-party UI frameworks or external dependencies**:
+
+| Platform | Binary / Package | Native Language & Graphics Stack | Frosted-Glass Engine | Third-Party UI Deps |
+| :--- | :--- | :--- | :--- | :---: |
+| **Linux CLI (TUI)** | `openfir-tui` | **Pure C11** (`termios`, `ioctl`, SGR 1006 mouse, DEC 2026 sync) | 24-bit TrueColor spatial-blur alpha-blended glass cards + 2×4 Unicode Braille sparklines over animated aurora | **0** (no `ncurses`) |
+| **Linux Desktop** | `openfir-gui` | **Pure C++20** + raw **X11 (`libX11`) + `libXft`** | Custom ARGB32 2-pass separable Gaussian-blur frosted glass compositor + SDF neon geometry | **0** (no GTK/Qt/Electron) |
+| **Windows x64** | `OpenFIR.exe` | **Pure C++20** + **Win32 + Direct2D + DirectWrite + DWM** | Native Windows 11 DWM Acrylic (`DWMWA_SYSTEMBACKDROP_TYPE`) + GPU Direct2D translucent glass & sparklines | **0** (Win32 SDK only) |
+| **macOS 13+** | `OpenFIR.app` | **Pure Swift** + **AppKit (`NSVisualEffectView`) + SwiftUI** | Native macOS `.hudWindow` system vibrancy over animated `Canvas` aurora + `NSOpenPanel` | **0** (Apple SDK only) |
+| **iOS 15.0+** | `OpenFIR-iOS.ipa` | **Pure Swift** + **SwiftUI + UIKit (`.ultraThinMaterial`)** | Native iOS ultra-thin frosted glass material + Files `fileImporter` integration | **0** (Apple SDK only) |
+| **Android 8–15+** | `OpenFIR-Android.apk` | **Pure Kotlin** + **Android Platform SDK + C11 JNI** | Native Android 12+ GPU `RenderEffect.createBlurEffect` + custom hardware-accelerated `Canvas` glass | **0** (no AndroidX/Material/Compose) |
+
+### Local Build Examples (Linux)
+```bash
+# 1. Build zero-dependency OpenFIR C ABI core library
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
+  -ldflags="-s -w -extldflags=-Wl,-soname,libopenfir_core.so" \
+  -o dist/libopenfir_core.so ./cmd/openfir-cabi
+
+# 2. Build & verify Pure C11 Linux Frosted-Glass TUI (zero ncurses)
+make -C apps/linux-tui test
+
+# 3. Build & verify Pure C++20 Linux X11 Gaussian-Blur GUI (zero GTK/Qt)
+make -C apps/linux-gui test
+```
+
+---
+
 ## Clean-Room Provenance, IP Purity & Legal Compliance
 
 ### 1. Patent-Free & Public-Domain Algorithm Provenance
