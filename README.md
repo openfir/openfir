@@ -1,174 +1,134 @@
 [![DOI](https://zenodo.org/badge/1460848493.svg)](https://doi.org/10.5281/zenodo.24297603)
-# OpenFIR (`openfir`)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**OpenFIR** (**Open** **F**ast **I**nterleaved **R**eliable Transport Protocol) is a high-performance, multi-path, delay-gradient controlled, algebraically self-healing UDP file and directory transfer engine written in pure Go with zero external dependencies.
+# OpenFIR (`openfir`) v1.0
 
-Engineered for high Bandwidth-Delay Product (BDP) wide-area networks, transcontinental links, satellite backhauls, and lossy wireless channels, OpenFIR decouples congestion control from random packet loss while eliminating retransmission round-trip penalties through inline coprime-stride erasure interleaving, intra-session and cross-session content-addressed zero-byte teleportation, zero-RTT virtual continuous directory extents, self-healing $M \times N$ multi-socket 5-tuple striping, and zero-extra-RTT X25519 Perfect Forward Secrecy (PFS).
+**OpenFIR** (**Open** **F**ast **I**nterleaved **R**eliable Transport Protocol) is an open, standards-aligned, bidirectional (`push` & `pull`), enterprise-grade **pure file and directory transfer engine** written in Go under the **Apache License 2.0**.
 
----
+Engineered for high Bandwidth-Delay Product (BDP) wide-area networks, transcontinental links, satellite backhauls, and ISP UDP-policed environments, OpenFIR v1.0 combines **standard RFC 8446 TLS 1.3 (`ALPN: openfir/1`)** with a **transparent, open-header UDP acceleration lane (`OF1\x01`, Linux `UDP_SEGMENT` GSO + `UDP_GRO`)**, **clean-room 1981 Rabin polynomial Content-Defined Chunking (CDC)** with exact 0%-false-positive cross-session CAS, **clean-room systematic Cauchy GF(256) Reed-Solomon FEC** (0% loss = strictly 0% overhead), **rate-invariant Kalman delay-gradient congestion control**, **streaming BLAKE2b-256 binary Merkle verification**, **tarless `VirtualDirectoryExtent` directory streaming**, and **persistent crash-resumable staging**.
 
-## Core Architectural Innovations
-
-### 1. Inline Staggered & Adaptive $\phi$-Parity Coprime-Stride Interleaving
-Conventional Forward Error Correction (FEC) schemes group contiguous packets into block parity equations and emit parity bursts at block boundaries, which fail when network links experience Gilbert-Elliott contiguous burst losses.
-* **Socket-Coprime Stride Interleaving:** OpenFIR weaves GF(2) algebraic parity equations (`PKT_PHI_PARITY`, carrying `SendTimestampNano` for continuous delay telemetry) across non-adjacent chunks separated by a stride $S$ automatically chosen to be coprime to the client socket count ($\gcd(S, N) = 1$, default $S = 5$ within sliding window $W = 4S = 20$ for $N = 8$). Any contiguous burst loss of up to $S$ packets impacts at most **one** symbol per algebraic equation, and no two members of an equation share a degraded 5-tuple path.
-* **Inline Staggered Parity Injection:** Rather than emitting all $S$ parity frames in a back-to-back micro-burst at the end of a window, parity bucket $b \in [0..S-1]$ is injected inline immediately after its final member chunk ($W - S + b$) is sent—smoothing wire pacing and accelerating receiver peeling-decoder recovery.
-* **Adaptive Cruise / Armor Scaling & $O(1)$ Peeling Graph:** On lossless links, OpenFIR operates in **Cruise Mode** (1 parity frame per window = 5% minimal probe overhead at $W=20$). The instant the receiver reports a NACK or an active peeling-decoder heal event, the sender automatically shifts into **Full Armor Mode** ($S$ coprime-stride parity frames per window = 25% protection) and smoothly scales back once the link stabilizes. On the receiver, an **$O(1)$ adjacency-indexed bipartite peeling graph (`chunkToEqs`, up to 2,048 active equations)** resolves cascades without linear equation scans under session locks.
-
-### 2. Intra-Session & Cross-Session Content-Addressed Zero-Byte Teleportation (`PKT_TELEPORT` & `PKT_CAS_TELEPORT`)
-Real-world datasets—such as virtual machine images, container layers, source trees, database snapshots, and incremental backups—contain substantial block redundancy both within a single transfer and across separate transfers over time.
-* **Intra-Session Bidirectional Cloning (`PKT_TELEPORT`) & Sparse Zero Sentinel:** The sender computes cryptographic SHA-256 digests for outgoing chunks on the fly (with an adaptive high-entropy bypass and 1-in-64 probe for incompressible media/archives). All-zero blocks immediately emit a reserved `ZeroChunkSentinel` (`0xFFFFFFFF`) skipping both SHA-256 and source disk reads. Duplicate chunks suppress the 1,200-byte payload and transmit a compact **27-byte `PKT_TELEPORT` instruction**, modeled on the receiver as a bidirectional GF(2) equality edge (`Target ⊕ Source = 0`) that heals whichever side is missing once either arrives.
-* **Cross-Session Persistent CAS Teleportation (`PKT_CAS_TELEPORT`):** The server indexes completed files in its output directory into a persistent `GlobalCASStore` (`SHA-256 -> FilePath, Offset, Length`, bounded by a 1.5s synchronous startup budget + background indexing and a 64-slot `FDLRUCache`) and embeds an **8,192-bit (1,024-byte, $k=4$) Bloom filter summary** directly inside `PKT_HANDSHAKE_ACK` at zero extra RTT cost. When transferring an updated file or directory in a later session, matching chunks are transmitted as **55-byte `PKT_CAS_TELEPORT` instructions** carrying the full 256-bit SHA-256 digest. The receiver materializes and cryptographically verifies the chunk directly from existing local files on disk.
-* **Real-Time CAS Circuit Breaker & Lossless Urgent-NACK Fallback:** `PKT_FEEDBACK` continuously reports `casHits` and `casMisses`. If a fresh, unrelated dataset hits a saturated Bloom filter (hit rate $< 25\%$ after 64 probes), the client immediately trips its CAS circuit breaker to prevent false-positive storms. Any Bloom false positive or stale local CAS entry queues into a 4,096-slot lossless `urgentNacks` buffer on the receiver and strictly retransmits as a raw `PKT_DATA` frame, guaranteeing 100% forward progress and zero collision risk.
-
-### 3. Zero-RTT Virtual Continuous Extent for Massive Small Files (`VirtualDirectoryExtent`)
-Transferring tens of thousands of small files individually over high-RTT links suffers from catastrophic per-file handshake latency and filesystem `fsync` storms.
-* **Tarless Zero-Temp-Disk Streaming:** When `-file` points to a directory, OpenFIR maps the entire directory tree (including empty subdirectories while skipping symlinks) in memory onto a **single deterministic Virtual Continuous Byte Extent** without writing any temporary archive to the sender's disk.
-* **$O(\log N)$ Random-Access Retransmission & Bounded LRU FD Pool:** File boundaries are indexed in an interval array. Arbitrary chunk reads and out-of-order NACK retransmissions resolve the underlying small file slices in $O(\log N)$ time via binary search, backed by a bounded **64-slot `FDLRUCache`** to prevent `EMFILE` descriptor exhaustion and open/close thrashing.
-* **Hardened Extraction & Micro-File Coalescing:** Multiple tiny files are automatically coalesced into single 1,200-byte UDP frames while `unpackDirectoryBundle` enforces strict root-containment validation (blocking traversal, Windows volume-relative paths, NUL/backslash injection, and symlink overwrites).
-
-### 4. Per-Path Kalman-Filtered One-Way Delay Gradient (KF-OWDG) & CAR-Aware Congestion Control
-Instead of reducing transmission rates upon random packet loss or relying on two-way RTT measurements (which suffer from reverse-path ACK congestion), OpenFIR tracks the one-way arrival-versus-departure timestamp derivative independently per active 5-tuple path:
-
-$$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - T_{\text{send},k-1})$$
-
-* **Per-Path Isolation & 10s Sliding-Window `minOWD`:** Constant clock offsets cancel out algebraically without NTP synchronization. Maintaining an independent `KalmanOWDTracker` per client 5-tuple isolates ECMP multi-path latency differentials, while a 2-bucket 10-second sliding minimum baseline eliminates quartz clock-frequency drift and standing-queue baseline creep.
-* **Zero-Queue CAR Policer Defense & Windows Pacer Uncapping:** A 1D Kalman filter separates OS scheduling jitter from true bottleneck queue buildup while a **BBR-style delivery-rate ceiling (`btlBw`)** derived from receiver `RecvCount` distinguishes genuine random packet loss (no slowdown) from zero-queue carrier CAR token-bucket policers (smoothly capping pacing near `1.25×` observed delivery rate). `MicroPacer` dynamically scales burst headroom (`25ms × rateBps`, `64 KB .. 8 MB`) to sustain multi-Gbps speeds even under Windows' 15.6ms timer granularity.
-
-### 5. $M \times N$ Multi-Port Matrix, Zero-Leak Watchdog & X25519-PFS Polymorphic Wire Security
-* **$M \times N$ Multi-Port Matrix & Strict 4-Tuple Symmetry (`-port-span` & `-sockets`):** The server natively binds a contiguous matrix of $M$ UDP ports (`-port-span 4` by default) with parallel kernel reader loops and advertises them in `PKT_HANDSHAKE_ACK`. All server responses are pinned strictly to the exact server socket that received each client path, while stateless HMAC cookies bind full `(ClientIP, ClientPort, TxID, TimeSlot)` 4-tuples alongside 90-second completed-`TxID` anti-replay tombstones.
-* **Zero-Leak 12 MB Morphing, Dynamic Dead-Path Watchdog & Finalization Keepalives:** Client UDP sockets bind in the low non-privileged band (`10000..32000`) and hot-swap to fresh local ports and alternate server matrix ports either upon reaching a 12 MB byte quota or after sustained unanswered-send silence (`max(600ms, 4*N*15ms + 300ms)`). Retired sockets drain and close cleanly after 2 seconds (zero FD/goroutine leaks on multi-tens-of-GB transfers), and the server emits 500ms `PKT_FEEDBACK` keepalives during `fsync`/SHA-256/unpack finalization so large transfers never trip idle watchdogs.
-* **Zero-Extra-RTT X25519 PFS & AES-256 PRF Polymorphic Printable-ASCII Header:** Piggybacks ephemeral `crypto/ecdh` X25519 key agreement into handshake so every session derives unique directional `AES-256-GCM` keys (true forward secrecy and zero cross-session nonce reuse). Every datagram begins with a 22-byte authenticated outer header (`[6B Polymorphic Printable ASCII][8B MaskedSeq][4B MaskedSID][4B RandSalt]`) generated by an uninvertible **AES-256 single-block PRF** and pooled **AES-256-CTR CSPRNG**, protected by per-session server sequence counters and a **16,384-packet sliding anti-replay window**.
+> **Supply-Chain & Legal Purity**: OpenFIR v1.0 has **zero third-party GitHub module dependencies**. Compiled binaries link exclusively against the **Go Standard Library** and the official Go project extension modules **`golang.org/x/crypto`** and **`golang.org/x/sys`**. Every transport, chunking, compression, erasure-coding, and congestion-control algorithm is either a clean-room original implementation of >25-year public-domain mathematics, a CC0 public-domain primitive, or an open royalty-free IETF/NIST RFC standard.
 
 ---
 
-## System Architecture
+## Upgrading from Legacy `v0.x` (Breaking Wire Change)
+
+`v1.0.0` is a ground-up architectural rewrite establishing the stable `openfir/1` protocol specification:
+
+| Subsystem | Legacy `v0.x` (Deprecated Experimental) | Stable `v1.0.0` (Current) |
+| :--- | :--- | :--- |
+| **Transport & Firewall Compliance** | Pure UDP only; custom 6B ASCII header + 12MB port rotation + 4-port matrix | **Single-Port Dual-Stack (`:443` / `:9900`)**: Standard **RFC 8446 TLS 1.3 (`ALPN: openfir/1`)** control & parallel TCP data lanes + transparent **`OF1\x01`** 17B AAD UDP data lane |
+| **ISP UDP QoS / Blackhole Defense** | Stalls when UDP is blocked or throttled across an IP | **Hybrid UDP + Multi-Stream TLS 1.3 TCP Scheduler**: Sub-second automatic failover when UDP is blocked from packet #0 or blackholed mid-stream |
+| **Chunking, CAS & Verification** | 1,200B fixed chunks (0% reuse on 1B insert) + 8,192-bit Bloom (saturates at ~10MB) + upfront full-disk SHA-256 stall | **0ms Cold-Start 1981 Rabin Polynomial CDC** (48B sliding window, >98% 1-byte shift immunity) + **Exact 0%-FP Interactive TLS CAS** + **Streaming Binary Merkle Tree (BLAKE2b-256)** |
+| **Forward Error Correction** | GF(2) 4-XOR + 5% cruise overhead on clean links | **Clean-Room Cauchy GF(256) Reed-Solomon**: **0% loss = strictly 0% parity overhead**; recovers contiguous multi-packet burst drops in a single solve |
+| **Congestion Control** | 50 MiB/s cold start + raw µs delta + hardcoded 20ms retx cooldown + 8MB burst | **Delay-Gradient & Delivery-Rate CC**: Safe 4 MiB/s RFC 5681 Slow Start + **RFC 6298 `SRTT`** + **dynamic `max(1.25×SRTT+RTTvar, 25ms)` cooldown** + **normalized 1960 Kalman OWDG** + **CAR-safe ≤256KB burst** |
+| **Compression & Kernel NetIO** | Uncompressed single-packet syscalls | **Entropy-Gated RFC 1951 DEFLATE (`compress/flate`, 4KB sample bypass) + All-Zero Sentinel** + **Linux `UDP_SEGMENT` (GSO) / `UDP_GRO` (`ReadBatchGRO`) / `SO_REUSEPORT`** + **Windows `timeBeginPeriod(1)`** |
+| **Direction & Resumability** | Push-only; staging deleted on 25s timeout | **Bidirectional `push` & `pull`** + **Persistent `.openfir-part` / `.openfir-state` Crash-Resume** across disconnects & server restarts |
+| **Authentication & KDF** | Single HKDF on `pass:` | **Argon2id (RFC 9106, 32 MiB)** + **TLS 1.3 RFC 5705 `ExportKeyingMaterial` Channel-Bound Mutual Auth** + **Ephemeral X25519 PFS AES-256-GCM** |
+
+> Both server and client must run `v1.0.0+`. Historical `v0.1.0 ~ v0.7.0` source history and tags are preserved untouched for auditability (`legacy/v0.7` archive branch).
+
+---
+
+## Core Architecture
 
 ```text
-+-----------------------------------------------------------------------------------+
-|                                  OpenFIR SENDER                                   |
-|                                                                                   |
-|  [Single File OR Directory Tree] --> [Virtual Continuous Extent + 64-FD LRU Pool] |
-|                                                    |                              |
-|                                                    v                              |
-|           [Zero-Chunk Fast Path + SHA-256 Index + CAS Bloom + Circuit Breaker]    |
-|                                   /                |                \             |
-|                        (New Hash)/      (CAS Bloom)|     (Seen/Zero) \            |
-|                                 v                  v                  v           |
-|  [Coprime Adaptive Phi-Parity]<-[PKT_DATA] [PKT_CAS_TELEPORT]   [PKT_TELEPORT]    |
-|             |                      \               |                 /            |
-|             v                       v              v                v             |
-|     [PKT_PHI_PARITY] -------------> [Adaptive-Burst CAR-Aware MicroPacer]         |
-|                                                |            ^                     |
-|                                                v            | (Per-Path KF-OWDG   |
-|            [AES-256 PRF ASCII AAD + MaskedSeq/SID + X25519-PFS AES-256-GCM]       |
-|                                                |            |  + BBR DeliveryCap) |
-|                                                v            |                     |
-|        [Zero-Leak Low-Port Striping Pool (1..N, Dynamic Watchdog / 12MB Morph)]   |
-+------------------------------------------------|------------+---------------------+
-                                                 |            |
-                               M x N 5-Tuple UDP |            | Symmetric 4-Tuple
-                              (High-BDP / Lossy) v            | PKT_FEEDBACK
-+------------------------------------------------|------------+---------------------+
-|                                 OpenFIR RECEIVER            |                     |
-|                                                             |                     |
-|         [Multi-Port Server Matrix (1..M) + Multi-Core X25519-PFS AES-GCM Pool]    |
-|                           /              |              \            \            |
-|            (PKT_PHI_PARITY)          (PKT_DATA)   (PKT_TELEPORT) (PKT_CAS_TELEPORT)
-|                   \                      |              /            /            |
-|                    v                     v             v            v             |
-|      [O(1) Adjacency Peeling Graph] => [Commit + L1 Cache] <= [Global CAS + LRU]  |
-|                                                |                                  |
-|                                                v                                  |
-|         [Atomic .openfir-part Staging + Finalization Keepalive + SHA-256 Rename]  |
-+-----------------------------------------------------------------------------------+
++------------------------------------------------------------------------------------+
+|                              OpenFIR v1.0 SENDER                                   |
+|                                                                                    |
+|  [File OR Directory Tree] -> [VirtualDirectoryExtent (O(log N), 64-FD LRU)]        |
+|                                        |                                           |
+|                                        v                                           |
+|      [0ms Cold-Start 1981 Rabin Polynomial CDC (48B Window, BLAKE2b-256)]          |
+|                     |                                     |                        |
+|        (Streaming Merkle Tree)           (Interactive TLS 1.3 CAS / Resume Query)  |
+|                                               /           |            \           |
+|                                    (CAS/Resume Hit)  (All-Zero)     (New Block)    |
+|                                          |                |              v         |
+|                                      [0 Wire B]    [MsgZeroBlock] [4KB Entropy-    |
+|                                                                    Gated DEFLATE]  |
+|                                                                          |         |
+|                                       [Hybrid Anti-QoS Path Scheduler] <-+         |
+|                                        /                            \              |
+|               (Healthy High-BDP Link) /                              \ (Fallback / |
+|                                      v                                v Parallel)  |
+|        [Clean-Room Cauchy GF(256) RS (0% loss = 0 parity)]   [K Parallel TLS 1.3   |
+|         -> [Delay-Gradient & CAR-Safe MicroPacer (<=256KB)]   TCP Data Lanes]      |
+|         -> [OF1\x01 17B AAD + X25519-PFS AES-256-GCM]                |             |
+|         -> [Linux UDP_SEGMENT GSO Batch Writer]                      |             |
++--------------------------------------|-------------------------------|-------------+
+                                       | Single Port (:443 / :9900)    |
+                    UDP (OF1\x01)      v                               v  TCP (TLS 1.3 ALPN openfir/1)
++--------------------------------------|-------------------------------|-------------+
+|                              OpenFIR v1.0 RECEIVER                   |             |
+|                                      |                               |             |
+|   [Linux UDP_GRO ReadBatchGRO + 16,384-Pkt Replay Window]            |             |
+|    -> [Cauchy GF(256) RS Decoder + Normalized Kalman OWDG]           |             |
+|                                       \                             /              |
+|                                        v                           v               |
+|           [BLAKE2b-256 Block Verify + Persistent .openfir-part/.openfir-state]     |
+|                                        |                                           |
+|                                        v                                           |
+|       [Streaming Binary Merkle Root Verify -> fsync -> Atomic Commit / Unpack]     |
++------------------------------------------------------------------------------------+
 ```
 
 ---
 
-## Wire Frame Specification
+## Open Wire Specification (`openfir/1`)
 
-All frames are encapsulated inside an authenticated outer AEAD envelope (38 bytes total overhead: 22-byte AAD + 16-byte GMAC tag):
+OpenFIR v1.0 uses strictly transparent, Wireshark- and enterprise-firewall-friendly framing with **zero protocol spoofing or port-hopping obfuscation**:
 
-```text
-+----------------------------+------------------+------------------+------------------+-------------------------+
-| Polymorphic ASCII Hdr (6B) | Masked Seq (8B)  | Masked SID (4B)  | CSPRNG Salt (4B) | AES-256-GCM Cipher+Tag  |
-| 5B [0x21..7E] + 1B AES-PRF | seq ^ AES-PRF    | sid ^ AES-PRF    | AES-CTR DRBG 32  | (Inner Frame + 16B Tag) |
-+----------------------------+------------------+------------------+------------------+-------------------------+
-|<------------------------------------- 22-Byte GCM AAD ----------------------------->|
-                             |<-- 8B Nonce ---->|                  |<-- 4B Nonce --->|
-```
-
-* `SID == 0` routes pre-session handshake/challenge frames under master pre-session keys; `SID != 0` routes session frames under ephemeral per-session X25519 PFS keys.
-* The 12-byte AES-256-GCM nonce is reconstructed as `UnmaskedSeq(8B) || CSPRNGSalt(4B)`.
-
-Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame begins with an 11-byte routing header (`[0x4F, 0x46, FrameType, 8B TxID]`):
-
-| `FrameType` | Name | Inner Payload Layout (after `3B Hdr + 8B TxID`) | Description |
-| :--- | :--- | :--- | :--- |
-| `0x01` | `PKT_HANDSHAKE` | `[16B Cookie][32B ClientX25519Pub][8B Size][4B ChunkSz][4B Chunks][32B SHA256][1B Flags][2B NameLen][Name]` | Session initialization + X25519 PFS public key (`Flags=0x01` indicates directory bundle) |
-| `0x02` | `PKT_HANDSHAKE_ACK` | `[4B HighestContig][4B SessionSID][32B ServerX25519Pub][4B CASCnt][1024B CASBloom][1B PortCnt][M*2B MatrixPorts]` | Session confirmation, PFS SID & server X25519 pubkey, resume offset, CAS Bloom & Server Port Matrix |
-| `0x03` | `PKT_DATA` | `[4B ChunkIdx][8B SendTimestampNano][2B DataLen][Payload]` | Standard data payload frame |
-| `0x04` | `PKT_TELEPORT` | `[4B TargetIdx][4B SourceIdx][8B SendTimestampNano]` | Intra-session bidirectional clone instruction (`SourceIdx=0xFFFFFFFF` denotes sparse all-zero chunk) |
-| `0x05` | `PKT_PHI_PARITY` | `[8B SendTimestampNano][1B MemberCount][N*4B MemberIndices][2B ParityLen][XORPayload]` | Coprime-stride interleaved GF(2) erasure recovery frame with OWDG timestamp |
-| `0x06` | `PKT_FEEDBACK` | `[4B HighestContig][4B ScanLimit][4B RecvCnt][8B GradUs][8B QueueUs][4B CASHits][4B CASMisses][2B Flags+NackCnt][N*4B Nacks]` | Selective repeat SACK/NACK bitmap + peeling/finalizing signals + CAS telemetry + Per-Path Kalman OWDG |
-| `0x07` | `PKT_FIN` | *(empty)* | Sender completion notification |
-| `0x08` | `PKT_FIN_ACK` | `[1B VerifiedStatus]` | End-to-end SHA-256 verification confirmation |
-| `0x09` | `PKT_ERROR` | `[1B ErrorCode][2B MsgLen][ErrorMessage]` | Explicit fatal error abort notification |
-| `0x0A` | `PKT_COOKIE_CHALLENGE` | `[16B StatelessHMACCookie]` | Stateless anti-spoofing 4-tuple HMAC cookie challenge |
-| `0x0B` | `PKT_CAS_TELEPORT` | `[4B TargetIdx][32B FullSHA256][8B SendTimestampNano]` | Cross-session persistent CAS zero-byte local clone instruction |
+1. **Control & Parallel TCP Data Lanes**: Standard **RFC 8446 TLS 1.3** over TCP advertising **`ALPN: openfir/1`**, authenticated mutually via **RFC 5705 `ExportKeyingMaterial`** (`EXPORTER-OpenFIR-v1-ChannelBind`), binding the shared secret cryptographically to the live TLS 1.3 handshake to defeat active MITM even when using ephemeral self-signed certificates.
+2. **UDP Data Lane** (33 bytes total overhead: 17-byte cleartext AAD header + 16-byte AES-256-GCM tag):
+   ```text
+   +-------------------+-----------+---------------+------------------+------------------------+
+   | Magic "OF1\x01"   | Flags(1B) | SessionID(4B) | MonotonicSeq(8B) | AES-256-GCM Cipher+Tag |
+   +-------------------+-----------+---------------+------------------+------------------------+
+   |<----------------------------- 17-Byte AAD ----------------------->|
+   ```
+   * Per-session directional `c2s`/`s2c` AES-256-GCM keys and 4-byte nonce salts are derived from `HKDF-SHA256(MasterKey || EphemeralX25519SharedSecret, SessionID)`.
+   * Nonce is `DirSalt(4B) || MonotonicSeq(8B)`; inbound packets pass a **16,384-packet sliding anti-replay bitmap**.
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-* **Go 1.20+** (Zero external library dependencies; uses only the Go standard library).
-
-### 1. Run Built-In Chaos Self-Test (`selftest` mode)
-OpenFIR includes an integrated Gilbert-Elliott burst-loss chaos simulator that automatically validates **five** test suites under 8% burst packet loss (plus oversized datagram resilience):
-1. Three consecutive 16 MB mixed-entropy + sparse-zero large file transfers across a 4×8 multi-port matrix;
-2. A 200-file nested directory tree (including empty subdirectories) via Zero-RTT Virtual Extent;
-3. Concurrent multi-client transfers to a single server (independent X25519 PFS keys and sequence spaces);
-4. Cross-session persistent CAS instant teleportation across incremental datasets;
-5. Fresh high-entropy file transfer under a saturated CAS Bloom filter (validating the real-time CAS circuit breaker).
+### Install / Build from Source (Go 1.26+)
 
 ```bash
-go run openfir.go -mode selftest
+# Install directly via Go modules
+go install github.com/openfir/openfir/cmd/openfir@v1.0.0
+
+# Or build locally from a cloned repository
+go build -trimpath -ldflags="-s -w" -o bin/openfir ./cmd/openfir
 ```
 
-### 2. Production Server & Client Usage
+### 1. Run Built-In Enterprise Self-Test (`selftest` mode)
+Validates 4 end-to-end suites locally: (1) 4 MiB mixed-entropy Hybrid Auto Push & Bidirectional Pull (`FECParity=0`); (2) 17-byte prepended shift-resistant Rabin CDC CAS teleportation; (3) 10% 4-packet contiguous burst-loss pure UDP recovery with clean-room Cauchy GF(256) RS; (4) mid-stream 100% ISP UDP blackhole seamless failover to multi-stream TLS 1.3 TCP.
 
-#### Build Binary
 ```bash
-go build -trimpath -ldflags="-s -w" -o openfir openfir.go
+./bin/openfir -mode selftest
 ```
 
-#### Generate a 256-Bit Secret Key
-```bash
-export OPENFIR_SECRET=$(openssl rand -hex 32)
-```
+### 2. Production Server, Push & Pull
 
-#### Start Receiver (`server` mode)
 ```bash
-./openfir -mode server -listen 0.0.0.0:9900 -port-span 4 -out ./downloads -secret "$OPENFIR_SECRET"
-```
+# 1. Generate a 256-bit shared secret key
+export OPENFIR_SECRET=$(./bin/openfir -mode keygen)
 
-#### Send a Single Large File OR an Entire Directory of Small Files (`client` mode)
-```bash
-# Transfer a single large file
-./openfir -mode client \
-  -server 203.0.113.10:9900 \
-  -file /path/to/large_archive.iso \
-  -sockets 8 -init-mbps 100 -max-mbps 1000 \
-  -secret "$OPENFIR_SECRET"
+# 2. Start Single-Port Dual-Stack Server (TLS 1.3 TCP + UDP on :443 or :9900)
+#    (Optional: pass -tls-cert / -tls-key for a CA-signed domain certificate)
+./bin/openfir -mode server -listen :443 -dir ./openfir_data -secret "$OPENFIR_SECRET" \
+  -tls-cert /etc/ssl/fullchain.pem -tls-key /etc/ssl/privkey.pem
 
-# Transfer a directory tree containing thousands of small files (Zero-RTT Virtual Extent)
-./openfir -mode client \
-  -server 203.0.113.10:9900 \
-  -file /path/to/project_directory \
-  -sockets 8 -init-mbps 100 -max-mbps 1000 \
-  -secret "$OPENFIR_SECRET"
+# 3. Push a file OR entire nested directory tree (Hybrid Auto: UDP GSO/FEC + TLS 1.3 TCP)
+./bin/openfir -mode push -server files.example.com:443 -verify-ca \
+  -file ./large_dataset -secret "$OPENFIR_SECRET"
+
+# 4. Pull a file OR directory tree back from server
+./bin/openfir -mode pull -server files.example.com:443 -verify-ca \
+  -file large_dataset -dir ./downloads -secret "$OPENFIR_SECRET"
 ```
 
 ---
@@ -177,37 +137,64 @@ export OPENFIR_SECRET=$(openssl rand -hex 32)
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `-mode` | `""` | Execution mode: `server`, `client`, or `selftest` |
-| `-listen` | `0.0.0.0:9900` | Primary UDP listen address for `server` mode |
-| `-port-span` | `4` | Number of contiguous UDP ports in server listener matrix |
-| `-out` | `./openfir_downloads` | Output directory for received files/directories in `server` mode |
-| `-server` | `127.0.0.1:9900` | Target server UDP address for `client` mode |
-| `-file` | `""` | Path to the file OR directory to transmit in `client` mode |
-| `-secret` | `""` | Shared secret: 64-char hex (256-bit) or `pass:<passphrase>` (or via `OPENFIR_SECRET`) |
-| `-sockets` | `8` | Number of concurrent local UDP sockets for multi-path striping |
-| `-init-mbps` | `50.0` | Initial client pacing rate in MiB/s (MegaBytes/sec; e.g., `50` ≈ 400 Mbps) |
-| `-max-mbps` | `1000.0` | Maximum client pacing rate ceiling in MiB/s (MegaBytes/sec; e.g., `125` ≈ 1 Gbps) |
-| `-overwrite` | `false` | Allow server to overwrite existing destination files |
-| `-max-file-gb` | `64` | Maximum allowed transfer size in GB on server |
-| `-max-sessions` | `64` | Maximum concurrent active transfer sessions on server |
-| `-timeout` | `25` | Session idle/stall timeout in seconds |
-| `-sim-loss` | `0.0` | Simulated packet loss ratio (`0.0` in production; `0.08` auto-applied in `selftest`) |
-| `-sim-burst` | `4` | Simulated contiguous burst drop length |
+| `-mode` | `""` | Execution mode: `server`, `push`, `pull`, `keygen`, or `selftest` |
+| `-listen` | `:9900` | Single-port dual-stack (TLS 1.3 TCP + UDP) server listen address (e.g., `:443`) |
+| `-server` | `127.0.0.1:9900` | Target server address for `push` / `pull` |
+| `-sni` | *(host from `-server`)* | Optional TLS 1.3 SNI hostname |
+| `-verify-ca` | `false` | Enforce system/public CA certificate verification (recommended with `-tls-cert`) |
+| `-tls-cert` / `-tls-key` | `""` | Server TLS 1.3 certificate & private key PEM paths (auto-generates ephemeral ECDSA P-256 cert if omitted) |
+| `-dir` | `./openfir_data` | Server root directory (`server`) OR local output directory (`pull`) |
+| `-file` | `""` | Local file/directory path (`push`) OR remote file/directory name (`pull`) |
+| `-name` | *(basename of `-file`)* | Optional remote filename override for `push` |
+| `-secret` | `$OPENFIR_SECRET` | Shared secret: 64-char hex (256-bit) or `pass:<passphrase>` (Argon2id 32 MiB) |
+| `-transport` | `auto` | Data-plane mode: `auto` (Hybrid UDP + TLS 1.3 TCP), `udp`, or `tcp` |
+| `-tcp-streams` | `4` | Parallel TLS 1.3 TCP data lanes for `auto` / `tcp` modes |
+| `-init-mbps` | `4.0` | Initial slow-start pacing rate in MiB/s |
+| `-max-mbps` | `1000.0` | Maximum pacing rate ceiling in MiB/s |
+| `-max-parity` | `8` | Max Cauchy GF(256) RS parity shards per 16-shard group (0% loss = strictly 0 parity) |
+| `-overwrite` | `false` | Allow overwriting existing destination files or directories |
+| `-max-file-gb` | `256` | Maximum allowed transfer size in GB on server |
+| `-max-sessions` | `64` | Maximum concurrent active sessions on server |
 
 ---
 
-## Cryptography & Export Control Notice
+## Clean-Room Provenance, IP Purity & Legal Compliance
 
-This repository utilizes standard `AES-256-GCM`, `AES-256` PRF/CTR, `X25519` (`crypto/ecdh`), `HMAC-SHA256`, and `SHA-256` from the Go standard library (`crypto/aes`, `crypto/cipher`, `crypto/ecdh`, `crypto/hmac`, `crypto/sha256`) for forward-secret key agreement, packet confidentiality, and authentication. This software is publicly available open-source encryption source code eligible for license exception **TSU / EAR § 742.15(b)** under the U.S. Export Administration Regulations.
+### 1. Patent-Free & Public-Domain Algorithm Provenance
+Every core mechanism in OpenFIR v1.0 was intentionally selected and clean-room implemented to eliminate third-party patent encumbrances and copyleft obligations:
+
+| Component | Algorithm / Standard | Origin & Public-Domain / Open-Standard Basis |
+| :--- | :--- | :--- |
+| **Control & TCP Transport** | TLS 1.3 (`ALPN: openfir/1`) & Channel Binding | IETF RFC 8446 & RFC 5705 (Go stdlib `crypto/tls`) |
+| **AEAD & Forward Secrecy** | AES-256-GCM & X25519 ECDH | NIST SP 800-38D & IETF RFC 7748 (Go stdlib `crypto/aes`, `crypto/cipher`, `crypto/ecdh`) |
+| **Password KDF & Block Hash** | Argon2id & BLAKE2b-256 | IETF RFC 9106 & RFC 7693 — released under **CC0 Public Domain** (`golang.org/x/crypto`, BSD-3-Clause + Google `PATENTS` grant) |
+| **Content-Defined Chunking** | Classic Rabin Polynomial Rolling Fingerprint (48B window, single power-of-2 mask) | Michael O. Rabin (1981) & LBFS single-mask CDC (2001) — >25-year public-domain prior art; original degree-53 irreducible polynomial `0x003614c8012bce63` derived deterministically via SHA-256 |
+| **End-to-End Integrity** | Binary Merkle Tree over BLAKE2b-256 | Ralph Merkle (1979, patent expired 2002) — clean-room Go implementation |
+| **Forward Error Correction** | Systematic Cauchy GF(256) Reed-Solomon (`0x11D`) | Reed & Solomon (1960) & Blomer et al. Cauchy construction (1995) — >30-year textbook math, clean-room Go implementation with zero external libraries |
+| **Adaptive Compression** | Entropy-Gated RFC 1951 DEFLATE (`BestSpeed`) | IETF RFC 1951 (1993) — >30-year public-domain standard (Go stdlib `compress/flate`) |
+| **Congestion Control** | Delay-Gradient & Delivery-Rate CC | RFC 5681 slow start, RFC 6298 SRTT, Kalman filter (1960), and token-bucket pacing — clean-room Go implementation |
+| **Kernel Offloads** | `UDP_SEGMENT` (GSO), `UDP_GRO`, `SO_REUSEPORT`, `timeBeginPeriod` | Standard public Linux/Windows OS kernel ABI (`golang.org/x/sys`, BSD-3-Clause + Google `PATENTS` grant) |
+
+### 2. Defensive Publication & Prior Art Notice
+This repository and its Zenodo-archived DOI releases ([`10.5281/zenodo.24297603`](https://doi.org/10.5281/zenodo.24297603)) serve as an open technical reference and defensive publication of the OpenFIR protocol architecture under the Apache License 2.0.
+
+### 3. Third-Party Dependency Attribution & Binary Redistribution
+OpenFIR v1.0 has **zero third-party GitHub dependencies**. Its only external build dependencies are the Go Standard Library and the official `golang.org/x/crypto` and `golang.org/x/sys` modules (all **BSD-3-Clause** + Go Project **Additional IP Rights Grant (Patents)**). Complete verbatim third-party copyright and license notices are provided in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) and bundled in every official release archive alongside [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+### 4. Cryptography & Export Control Notice
+This repository utilizes standard `TLS 1.3`, `AES-256-GCM`, `X25519` (`crypto/ecdh`), `ECDSA P-256`, `HMAC-SHA256`, `SHA-256`, `Argon2id`, and `BLAKE2b-256` from the Go standard library and official `golang.org/x/crypto` packages for authenticated transport security, forward-secret key agreement, and cryptographic data integrity. This software is publicly available open-source encryption source code eligible for License Exception **TSU / EAR § 742.15(b)** under the U.S. Export Administration Regulations.
+
+### 5. Trademark & Warranty Disclaimer
+All third-party product, protocol, or operating-system names mentioned in this documentation (such as Linux, Windows, macOS, Wireshark, or Let's Encrypt) are used strictly for descriptive compatibility reference and remain the property of their respective owners. This software is provided **"AS IS"**, without warranty of any kind, express or implied, as set forth in Sections 7 and 8 of the Apache License 2.0. Nothing in this repository constitutes legal advice.
 
 ---
 
 ## License
 
-Copyright (c) 2026 The OpenFIR Authors. All rights reserved.
+Copyright (c) 2026 The OpenFIR Authors (`openfir`). All rights reserved.
 
 Licensed under the **Apache License, Version 2.0** (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at:
 
 http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the [`LICENSE`](LICENSE), [`NOTICE`](NOTICE), and [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) files for full terms and third-party attributions.

@@ -1,0 +1,8 @@
+bin/
+dist/
+*.exe
+*.openfir-part-*
+*.openfir-state
+*.openfir-state.tmp
+openfir_data/
+openfir_downloads/
