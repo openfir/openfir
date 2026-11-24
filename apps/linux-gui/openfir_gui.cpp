@@ -678,7 +678,7 @@ void compose_scene(GlassSurface &surf, GuiState &st, float t, std::vector<TextDr
     surf.draw_glass_card(header, 18.0f, true, true);
     surf.draw_hex_logo(header.x + 30, header.y + 31, 15.0f);
     texts.push_back({header.x + 56, header.y + 36, "OPENFIR", COL_TEXT_PRI, 2});
-    texts.push_back({header.x + 152, header.y + 35, "v1.1 FROST", COL_CYAN, 1});
+    texts.push_back({header.x + 152, header.y + 35, "v2.0 FROST", COL_CYAN, 1});
 
     const char *tab_labels[4] = {"PUSH", "PULL", "SERVER", "AUDIT"};
     int tx = header.x + 258;

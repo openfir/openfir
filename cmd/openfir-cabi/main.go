@@ -37,7 +37,7 @@ import (
 	"github.com/openfir/openfir/internal/security"
 )
 
-const engineVersionStr = "OpenFIR v1.1.0"
+const engineVersionStr = "OpenFIR v2.0.0"
 
 var (
 	versionCStr = C.CString(engineVersionStr)

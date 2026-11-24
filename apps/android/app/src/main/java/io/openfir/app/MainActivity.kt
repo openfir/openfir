@@ -133,7 +133,7 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
         }
         val ver = TextView(this).apply {
-            text = " v1.1 FROST"
+            text = " v2.0 FROST"
             setTextColor(FrostColors.CYAN)
             textSize = 11f
             typeface = Typeface.MONOSPACE

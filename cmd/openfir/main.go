@@ -46,7 +46,7 @@ func main() {
 	flag.Parse()
 
 	if *mode == "" {
-		fmt.Fprintf(os.Stderr, "OpenFIR v1.0 — Enterprise Hybrid TLS 1.3 + UDP GSO/FEC File & Directory Transfer Engine\n\n")
+		fmt.Fprintf(os.Stderr, "OpenFIR v2.0 — Enterprise Hybrid TLS 1.3 + UDP GSO/FEC File & Directory Transfer Engine\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  Generate 256-bit key : openfir -mode keygen\n")
 		fmt.Fprintf(os.Stderr, "  Run built-in test    : openfir -mode selftest\n")
@@ -92,7 +92,7 @@ func main() {
 			log.Fatalf("[Error] start server: %v", err)
 		}
 		defer srv.Close()
-		log.Printf("[Server] OpenFIR v1.0 listening on TLS 1.3 TCP %s + UDP :%d (root=%s, overwrite=%v)",
+		log.Printf("[Server] OpenFIR v2.0 listening on TLS 1.3 TCP %s + UDP :%d (root=%s, overwrite=%v)",
 			srv.Addr(), srv.UDPPort(), *rootDir, *overwrite)
 		<-ctx.Done()
 		log.Printf("[Server] Shutting down cleanly...")
@@ -157,7 +157,7 @@ func main() {
 
 func printStats(op string, st *engine.TransferStats) {
 	fmt.Printf("\n======================================================================\n")
-	fmt.Printf("[OpenFIR v1.0] %s 100%% Merkle-Verified!\n", op)
+	fmt.Printf("[OpenFIR v2.0] %s 100%% Merkle-Verified!\n", op)
 	fmt.Printf("  ├─ Size & Goodput   : %.2f MiB in %.3fs (Effective: %.2f MiB/s)\n",
 		float64(st.TotalBytes)/(1024*1024), st.Elapsed.Seconds(), st.GoodputMBps())
 	fmt.Printf("  ├─ Blocks Breakdown : Total=%d | CAS=%d | Resumed=%d | Zero=%d | Deflate=%d | Raw=%d\n",
@@ -169,7 +169,7 @@ func printStats(op string, st *engine.TransferStats) {
 }
 
 func runSelfTest(ctx context.Context) error {
-	fmt.Println("=== OpenFIR v1.0 Enterprise Self-Test (Hybrid TLS 1.3 + UDP GSO/GF256-RS + Rabin CDC CAS + ISP Blackhole Failover) ===")
+	fmt.Println("=== OpenFIR v2.0 Enterprise Self-Test (Hybrid TLS 1.3 + UDP GSO/GF256-RS + Rabin CDC CAS + ISP Blackhole Failover) ===")
 	tmpDir, err := os.MkdirTemp("", "openfir_v1_selftest_*")
 	if err != nil {
 		return err

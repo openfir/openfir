@@ -7,7 +7,7 @@ struct OpenFIRMacApp: App {
     @StateObject private var vm = OpenFIRBridge()
 
     var body: some Scene {
-        WindowGroup("OpenFIR v1.1 — Obsidian Frost") {
+        WindowGroup("OpenFIR v2.0 — Obsidian Frost") {
             OpenFIRMainView(vm: vm)
                 .frame(minWidth: 1020, minHeight: 680)
         }

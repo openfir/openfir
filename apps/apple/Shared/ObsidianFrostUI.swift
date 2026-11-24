@@ -243,7 +243,7 @@ public struct OpenFIRMainView: View {
                         Text("OPENFIR")
                             .font(.system(size: 19, weight: .bold, design: .rounded))
                             .foregroundColor(FrostPalette.textPri)
-                        Text("v1.1 FROST")
+                        Text("v2.0 FROST")
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .foregroundColor(FrostPalette.cyan)
                             .padding(.horizontal, 8)

@@ -29,8 +29,8 @@ android {
         applicationId = "io.openfir.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 110
-        versionName = "1.1.0"
+        versionCode = 200
+        versionName = "2.0.0"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }

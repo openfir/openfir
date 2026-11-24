@@ -802,7 +802,7 @@ static void render_ui(Canvas *c, AppState *st, double t) {
     /* 1. Top Frosted Header Strip */
     draw_glass_card(c, 1, 0, W - 2, 3, true, true, NULL);
     put_text(c, 3, 1, 24, "◆ OPENFIR", COL_AURORA_CYAN, 1);
-    put_text(c, 13, 1, 10, "v1.1 FROST", COL_AURORA_VIO, 1);
+    put_text(c, 13, 1, 10, "v2.0 FROST", COL_AURORA_VIO, 1);
 
     /* 4 Frosted Mode Tabs */
     const char *tab_names[4] = {"1 PUSH", "2 PULL", "3 SERVER", "4 AUDIT"};

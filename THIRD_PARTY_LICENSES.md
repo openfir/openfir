@@ -1,6 +1,6 @@
 # Third-Party Open Source Licenses
 
-OpenFIR v1.1 has **zero third-party GitHub module or UI library dependencies**.
+OpenFIR v2.0 has **zero third-party GitHub module or UI library dependencies**.
 Every protocol component (Rabin polynomial CDC, Streaming Merkle Tree, Systematic
 Cauchy GF(256) Reed-Solomon FEC, Delay-Gradient Congestion Control, Hybrid
 UDP/TLS-1.3 Engine, and Resumable Storage) and every native user interface

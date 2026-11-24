@@ -593,7 +593,7 @@ public:
         D2D1_RECT_F hdr = D2D1::RectF(pad, 16.0f, W - pad, 78.0f);
         draw_glass_card(hdr, 18.0f, true, true);
         draw_text("OPENFIR", D2D1::RectF(hdr.left + 24.0f, hdr.top + 17.0f, hdr.left + 135.0f, hdr.bottom), C_TEXT_PRI, tf_title);
-        draw_text("v1.1 FROST", D2D1::RectF(hdr.left + 130.0f, hdr.top + 22.0f, hdr.left + 220.0f, hdr.bottom), C_CYAN, tf_bold);
+        draw_text("v2.0 FROST", D2D1::RectF(hdr.left + 130.0f, hdr.top + 22.0f, hdr.left + 220.0f, hdr.bottom), C_CYAN, tf_bold);
 
         const char *tabs[4] = {"PUSH", "PULL", "SERVER", "AUDIT"};
         float tx = hdr.left + 240.0f;
