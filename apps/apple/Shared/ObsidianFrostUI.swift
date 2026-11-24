@@ -53,32 +53,43 @@ public struct MacVibrancyView: NSViewRepresentable {
 
 public struct AuroraPlasmaBackdrop: View {
     public init() {}
+
     public var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             Canvas { ctx, size in
-                ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(FrostPalette.bgVoid))
-                let orbs: [(CGPoint, CGFloat, Color)] = [
-                    (CGPoint(x: size.width * (0.20 + 0.06 * sin(t * 0.45)),
-                             y: size.height * (0.22 + 0.06 * cos(t * 0.37))),
-                     max(size.width, size.height) * 0.46, FrostPalette.cyan.opacity(0.28)),
-                    (CGPoint(x: size.width * (0.80 + 0.07 * cos(t * 0.32)),
-                             y: size.height * (0.78 + 0.06 * sin(t * 0.41))),
-                     max(size.width, size.height) * 0.50, FrostPalette.violet.opacity(0.32)),
-                    (CGPoint(x: size.width * (0.60 + 0.08 * sin(t * 0.27 + 1.2)),
-                             y: size.height * (0.26 + 0.07 * cos(t * 0.30))),
-                     max(size.width, size.height) * 0.34, FrostPalette.magenta.opacity(0.16))
-                ]
-                for (center, radius, color) in orbs {
-                    let grad = Gradient(colors: [color, color.opacity(0)])
-                    ctx.fill(
-                        Path(ellipseIn: CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)),
-                        with: .radialGradient(grad, center: center, startRadius: 0, endRadius: radius)
-                    )
-                }
+                drawAurora(in: &ctx, size: size, t: t)
             }
         }
         .ignoresSafeArea()
+    }
+
+    private func drawAurora(in ctx: inout GraphicsContext, size: CGSize, t: Double) {
+        ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(FrostPalette.bgVoid))
+        let maxDim: CGFloat = max(size.width, size.height)
+
+        let p1 = CGPoint(
+            x: size.width * CGFloat(0.20 + 0.06 * sin(t * 0.45)),
+            y: size.height * CGFloat(0.22 + 0.06 * cos(t * 0.37))
+        )
+        let p2 = CGPoint(
+            x: size.width * CGFloat(0.80 + 0.07 * cos(t * 0.32)),
+            y: size.height * CGFloat(0.78 + 0.06 * sin(t * 0.41))
+        )
+        let p3 = CGPoint(
+            x: size.width * CGFloat(0.60 + 0.08 * sin(t * 0.27 + 1.2)),
+            y: size.height * CGFloat(0.26 + 0.07 * cos(t * 0.30))
+        )
+
+        drawOrb(in: &ctx, center: p1, radius: maxDim * 0.46, color: FrostPalette.cyan.opacity(0.28))
+        drawOrb(in: &ctx, center: p2, radius: maxDim * 0.50, color: FrostPalette.violet.opacity(0.32))
+        drawOrb(in: &ctx, center: p3, radius: maxDim * 0.34, color: FrostPalette.magenta.opacity(0.16))
+    }
+
+    private func drawOrb(in ctx: inout GraphicsContext, center: CGPoint, radius: CGFloat, color: Color) {
+        let rect = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
+        let grad = Gradient(colors: [color, color.opacity(0)])
+        ctx.fill(Path(ellipseIn: rect), with: .radialGradient(grad, center: center, startRadius: 0, endRadius: radius))
     }
 }
 
